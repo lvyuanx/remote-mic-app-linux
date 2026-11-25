@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      try {
+        const preference = localStorage.getItem("sayall-theme-preference");
+        const dark =
+          preference === "dark" ||
+          (preference !== "light" && matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+      } catch {
+        // 存储不可用时由主题控制器按系统设置接管。
+      }
+    </script>
+    <link rel="icon" type="image/svg+xml" href="./sayall-linux.svg" />
+    <!-- 遥控器实物图只有 40 KB（WebP），在启动时就预取：切到按键页/首次设置时
+         图片已在缓存里，不会出现"热点锚点都排好了、照片还没到"（2026-10-28）。 -->
+    <link rel="preload" as="image" href="./RC003-remote-photo@2x.webp" type="image/webp" />
+    <title>SayAll</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=无线麦 Ubuntu 版
+Name[en]=SayAll Linux
+Comment=将兼容的蓝牙遥控器用作麦克风
+Comment[en]=Use a compatible Bluetooth remote as a microphone
+Exec=sayall-linux
+Icon=sayall-linux
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=Bluetooth;Microphone;Remote;蓝牙;麦克风;遥控器;
+StartupNotify=false
+StartupWMClass=Sayall-linux

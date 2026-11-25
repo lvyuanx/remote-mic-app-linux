@@ -1,0 +1,566 @@
+<script setup lang="ts">
+import { computed, onUnmounted, ref, watch } from "vue";
+import {
+  connectionPhaseLabel,
+  remoteModelLabel,
+  type PairedRemote,
+  type RuntimeSnapshot,
+} from "../../lib/bridge";
+import OptionCard from "../../components/onboarding/OptionCard.vue";
+import StatusRow from "../../components/onboarding/StatusRow.vue";
+import { t } from "../../lib/i18n";
+import { reportOnboardingEvent } from "../diagnostics";
+import {
+  RECONNECT_GUIDANCE_ATTEMPT,
+  RECONNECT_GUIDANCE_DELAY_MS,
+  shouldShowReconnectGuidance,
+} from "../reconnect-guidance";
+import {
+  RESET_GUIDANCE_DELAY_MS,
+  isGenericRemoteName,
+  shouldShowResetGuidance,
+} from "../reset-guidance";
+
+const props = defineProps<{
+  runtime: RuntimeSnapshot | null;
+  devices: PairedRemote[];
+  scanning: boolean;
+  scanMessage: string;
+  connectingDeviceId: string;
+  /** 本向导会话里连接成功的那台设备 id（启动恢复的连接拿不到，按目标状态即可）。 */
+  connectedDeviceId: string;
+  operationMessage: string;
+  buttonObserved: boolean;
+  voiceKeyMistake: boolean;
+  /** 当前门禁失败码（只用于显示修复卡；判据仍由 flow.evaluateGate 独裁）。 */
+  gateCode: string | null;
+  /**
+   * 等待按键期间收到过"另一支遥控器"的报文（Raw Input 按目标地址过滤后剩下的那些，
+   * 2026-10-13 现场：两支遥控器名字相同、用户按错一支时界面完全没解释）。
+   */
+  otherRemoteActivity: boolean;
+}>();
+
+defineEmits<{
+  scan: [];
+  connect: [device: PairedRemote];
+  openBluetoothSettings: [];
+}>();
+
+const CONNECTED_PHASES = ["ready", "streaming", "draining"] as const;
+
+const connectionPhase = computed(() => props.runtime?.platform.connection.phase ?? "idle");
+const connected = computed(() =>
+  (CONNECTED_PHASES as readonly string[]).includes(connectionPhase.value),
+);
+const reconnecting = computed(() => connectionPhase.value === "reconnecting");
+const reconnectAttempt = computed(() => props.runtime?.platform.connection.reconnectAttempt ?? 0);
+const phaseLabel = computed(() => connectionPhaseLabel(connectionPhase.value));
+
+/**
+ * 连续重连的本地计时（issue #104，2026-11-19）。
+ *
+ * 只用于决定「是否显示排查卡」，不参与连接逻辑；`reconnectAttempt >= 5`
+ * 另有兜底，用户中途进入第②步时不必再等一个完整的 60 秒。
+ */
+const reconnectWaitedMs = ref(0);
+let reconnectGuidanceTimer: number | undefined;
+
+function clearReconnectGuidanceTimer(): void {
+  if (reconnectGuidanceTimer !== undefined) {
+    window.clearTimeout(reconnectGuidanceTimer);
+    reconnectGuidanceTimer = undefined;
+  }
+}
+
+watch(
+  reconnecting,
+  (value) => {
+    clearReconnectGuidanceTimer();
+    reconnectWaitedMs.value = 0;
+    if (value) {
+      reconnectGuidanceTimer = window.setTimeout(() => {
+        reconnectWaitedMs.value = RECONNECT_GUIDANCE_DELAY_MS;
+      }, RECONNECT_GUIDANCE_DELAY_MS);
+    }
+  },
+  { immediate: true },
+);
+
+/**
+ * 「已连接但没有按键」的本地计时（2026-11-21 用户要求）。
+ *
+ * 连接就绪后 20 秒仍没有普通按键，才提示重置遥控器；正常按下按键或断开时
+ * 立即清零。与重连计时相互独立：两者不会同时显示。
+ */
+const connectedWithoutButtonMs = ref(0);
+let connectedWithoutButtonTimer: number | undefined;
+
+function clearConnectedWithoutButtonTimer(): void {
+  if (connectedWithoutButtonTimer !== undefined) {
+    window.clearTimeout(connectedWithoutButtonTimer);
+    connectedWithoutButtonTimer = undefined;
+  }
+}
+
+watch(
+  () => connected.value && !props.buttonObserved,
+  (waiting) => {
+    clearConnectedWithoutButtonTimer();
+    connectedWithoutButtonMs.value = 0;
+    if (waiting) {
+      connectedWithoutButtonTimer = window.setTimeout(() => {
+        connectedWithoutButtonMs.value = RESET_GUIDANCE_DELAY_MS;
+      }, RESET_GUIDANCE_DELAY_MS);
+    }
+  },
+  { immediate: true },
+);
+
+onUnmounted(() => {
+  clearReconnectGuidanceTimer();
+  clearConnectedWithoutButtonTimer();
+});
+
+const showReconnectGuidance = computed(() =>
+  shouldShowReconnectGuidance({
+    reconnecting: reconnecting.value,
+    reconnectAttempt: reconnectAttempt.value,
+    waitedMs: reconnectWaitedMs.value,
+    rawInputPhase: props.runtime?.platform.rawInput.phase ?? "stopped",
+    buttonObserved: props.buttonObserved,
+  }),
+);
+const modelLabel = computed(() =>
+  remoteModelLabel(props.runtime?.platform.connection.remoteModel ?? "unknown"),
+);
+
+/**
+ * 连接后显示的名称（2026-10-13 现场：必须能分清 2 / 2 Pro）。
+ * 优先用**型号**（运行时按 GATT 型号读回，是唯一能区分两支同型号名字的字段）；
+ * 型号未知时退回扫描列表里的系统名称，再退回运行时蓝牙名称。
+ */
+const connectedName = computed(() => {
+  const known = props.devices.find((device) => device.id === props.connectedDeviceId);
+  return known?.name ?? props.runtime?.platform.connection.remoteName ?? modelLabel.value;
+});
+
+/** 连接后能确定的具体型号标签（型号未知时为空串，避免露出「连接后显示」占位）。 */
+const connectedModelLabel = computed(() =>
+  (props.runtime?.platform.connection.remoteModel ?? "unknown") === "unknown"
+    ? ""
+    : modelLabel.value,
+);
+
+/**
+ * 设备行是否就是当前已连接的那台（2026-10-13 现场要求：连接后给"已连接"状态）。
+ *
+ * 判据优先级：**设备稳定令牌**（运行时快照的 `remoteToken` ↔ 扫描行的 `token`）——
+ * 这是唯一在"启动恢复的连接"（界面没点过连接）和"两支遥控器同名"时都能对上行的办法；
+ * 老快照/浏览器兜底没有令牌时，退回"本向导会话里连接成功的那台 id"。
+ */
+function isConnectedDevice(device: PairedRemote): boolean {
+  if (!connected.value) return false;
+  const token = props.runtime?.platform.connection.remoteToken ?? "";
+  if (token && device.token) return device.token === token;
+  return props.connectedDeviceId === device.id;
+}
+
+/**
+ * 按键行的说明句（2026-10-10 现场反馈）：系统侧按键通道可用 ≠ 应用自己的会话
+ * 已建立——遥控器与电脑配对完成后，按键就能被收到（第②步的按键行随之变绿），
+ * 但"继续"还要求应用连上遥控器。未连接时不再写"这一项可以继续了"（会与"先连接
+ * 遥控器，再继续"打架），改成指出还差的那一步。
+ * 2026-10-13 现场：连接就绪、按键也收到时**整行不再写任何说明句**——行本身已是
+ * 就绪状态、页脚门禁也放行，再写"这一项可以继续了。"是重复。
+ */
+const buttonRowDesc = computed(() => {
+  if (!props.buttonObserved) {
+    // 监听器在跑、但系统里没有匹配这支遥控器的按键接口时，再按也不会到达；
+    // 这里只给动作，具体原因由下方修复卡说明（2026-11-06 现场：这句话此前一直写
+    // "按一下"，用户按了很多次都没有反馈）。
+    if (
+      connected.value &&
+      (props.runtime?.platform.rawInput.phase ?? "stopped") === "awaiting"
+    ) {
+      return t("先按一下普通按键；仍无反应时，按下面的步骤重新配对。");
+    }
+    return t("按一下遥控器上的普通按键（比如主页键），不要按语音键。");
+  }
+  if (connected.value) return "";
+  // 说明句跟着用户当下能看到的下一步走：还没扫到设备 → 先扫；
+  // 设备已列出（候选不唯一 / 自动连接没触发）→ 直接点设备行右侧的按钮。
+  return props.devices.length === 0
+    ? t("按键已收到。还差一步：点“扫描已配对设备”选中遥控器连接。")
+    : t("按键已收到。还差一步：点遥控器一行右侧的“连接”。");
+});
+
+/** 扫描状态行：只在"扫描过 / 正在扫描"时出现，不新增空状态文案。 */
+const scanRow = computed(() => {
+  if (props.scanning) {
+    // 2026-10-13 现场：去掉"保持遥控器在旁边…"那句（点击后不再出提示词）。
+    return {
+      state: "busy" as const,
+      title: t("正在寻找小米遥控器…"),
+      desc: "",
+    };
+  }
+  if (props.devices.length > 0) {
+    return {
+      state: "ok" as const,
+      title:
+        props.devices.length === 1
+          ? t("找到 1 个已配对的小米遥控器")
+          : t("找到 {count} 个已配对的小米遥控器", { count: props.devices.length }),
+      desc: "",
+    };
+  }
+  if (props.scanMessage) {
+    return { state: "warn" as const, title: props.scanMessage, desc: "" };
+  }
+  return null;
+});
+
+/** 修复卡（对应失败矩阵的主要修复动作）；文案为短路标，判据与恢复动作不变。 */
+const FIX_TITLES: Record<string, string> = {
+  "bluetooth.unavailable": "蓝牙当前不可用",
+  "remote.pairing_required": "还没有已配对的遥控器",
+  "remote.not_found": "没有找到遥控器",
+  "remote.connect_failed": "连接没有成功",
+  "remote.hid_interface_missing": "没有识别到遥控器的按键通道",
+};
+
+const fixTitle = computed(() => {
+  const source = props.gateCode ? FIX_TITLES[props.gateCode] : null;
+  return source ? t(source) : null;
+});
+const fixPrefersSettings = computed(
+  () =>
+    props.gateCode === "bluetooth.unavailable" ||
+    props.gateCode === "remote.pairing_required" ||
+    props.gateCode === "remote.hid_interface_missing",
+);
+const fixShowsSettings = computed(() => props.gateCode !== "remote.connect_failed");
+
+/**
+ * 通用名 `MI RC`（2026-11-21 用户澄清）：它**只用于解释原因**，不是触发条件。
+ * 正常工作的遥控器也可能被 Windows 上报成这个名字；只有当前连接的那支（或
+ * 未连接时唯一候选）是 MI RC 才算，不能因为列表里躺着一支旧设备就误报。
+ */
+const connectedDevice = computed(
+  () => props.devices.find((device) => isConnectedDevice(device)) ?? null,
+);
+const genericRemoteName = computed(() => {
+  if (connected.value) {
+    return (
+      isGenericRemoteName(props.runtime?.platform.connection.remoteName) ||
+      isGenericRemoteName(connectedDevice.value?.name) ||
+      isGenericRemoteName(connectedName.value)
+    );
+  }
+  return props.devices.length === 1 && isGenericRemoteName(props.devices[0]?.name);
+});
+
+/**
+ * 一直连不上：复用重连排查卡的 60 秒 / 5 次阈值。`raw_input` 为 `awaiting`
+ * 时由「遥控器还没有真正连上」卡接管（它也包含重置步骤），这里只补它没覆盖的
+ * 情况（例如监听器在位、但蓝牙链路始终没有建立）。
+ */
+const showConnectStuckReset = computed(
+  () =>
+    reconnecting.value &&
+    !showReconnectGuidance.value &&
+    (reconnectWaitedMs.value >= RECONNECT_GUIDANCE_DELAY_MS ||
+      reconnectAttempt.value >= RECONNECT_GUIDANCE_ATTEMPT),
+);
+
+/**
+ * 重置遥控器引导：只在没有更具体的失败修复卡时显示，避免同一屏出现两张
+ * 都让用户"重新配对"的卡片（`remote.hid_interface_missing` 的修复卡本身
+ * 已包含重置步骤）。
+ */
+const showResetGuidance = computed(
+  () =>
+    !fixTitle.value &&
+    (showConnectStuckReset.value ||
+      shouldShowResetGuidance({
+        connected: connected.value,
+        buttonObserved: props.buttonObserved,
+        connectedWithoutButtonMs: connectedWithoutButtonMs.value,
+        rawInputPhase: props.runtime?.platform.rawInput.phase ?? "stopped",
+      })),
+);
+
+/** 重置卡当前属于哪种卡点：只影响标题/说明，不影响是否显示。 */
+const resetGuidanceKind = computed<"not_connected" | "generic_name" | "no_button">(() => {
+  if (!connected.value) return "not_connected";
+  return genericRemoteName.value ? "generic_name" : "no_button";
+});
+
+// 只在首次出现时记一条（状态未变化不重复刷）；support 靠它区分"用户看到的是
+// 连不上、通用名还是已连接无按键提示"。
+watch(
+  showResetGuidance,
+  (shown, previous) => {
+    if (!shown || previous === true) return;
+    reportOnboardingEvent({
+      kind: "remote_observed",
+      result: "unknown",
+      reason: "reset_guidance_shown",
+      step: "remote",
+      detail: resetGuidanceKind.value,
+    });
+  },
+  { immediate: true },
+);
+</script>
+
+<template>
+  <section class="onboarding-step">
+    <h1>{{ t("连接遥控器") }}</h1>
+    <p class="onboarding-lede">
+      {{ t("无线麦只支持小米蓝牙语音遥控器 2 和小米蓝牙语音遥控器 2 Pro（RC001 / RC003）。") }}
+    </p>
+
+    <!-- 「扫描已配对设备」保持常显（2026-10-13 现场），下方留出间距；
+         「打开蓝牙设置」入口已移到第①步的配对流程（失败修复卡里仍保留一份，见文件底部）。 -->
+    <div class="onboarding-chips onboarding-chips-scan">
+      <button
+        class="onboarding-chip strong"
+        type="button"
+        :disabled="scanning"
+        @click="$emit('scan')"
+      >
+        {{ scanning ? t("正在扫描…") : t("扫描已配对设备") }}
+      </button>
+    </div>
+
+    <!-- 2026-11-21 用户要求：只有找不到已配对遥控器时才显示这张提示卡，
+         并让它与下方设备行/状态行留出间距。 -->
+    <div
+      v-if="devices.length === 0 && !scanning"
+      class="onboarding-card onboarding-advanced-card"
+    >
+      <h4>{{ t("找不到遥控器？部分电脑需要打开「高级」") }}</h4>
+      <p>
+        {{ t("如果在蓝牙列表里找不到遥控器，可以打开高级设置：设置 → 蓝牙和其他设备 → 设备 → 向下滚动 → 蓝牙设备发现 → 高级") }}
+      </p>
+      <p>
+        {{ t("打开后回到这里点「扫描已配对设备」；添加设备时选择「显示所有设备」。") }}
+      </p>
+    </div>
+
+    <div class="onboarding-rows">
+      <StatusRow
+        v-if="scanRow"
+        :state="scanRow.state"
+        :title="scanRow.title"
+        :desc="scanRow.desc || undefined"
+      />
+      <OptionCard
+        v-for="device in devices"
+        :key="device.id"
+        indicator="none"
+        :selected="isConnectedDevice(device)"
+        :disabled="connectingDeviceId === device.id || isConnectedDevice(device)"
+        @select="$emit('connect', device)"
+      >
+        <!-- 已连接那行显示型号（2026-10-13 现场：同一支 Windows 名字可能完全一样，
+             只有型号能分清 2 / 2 Pro）。 -->
+        <strong>{{
+          isConnectedDevice(device) && connectedModelLabel
+            ? connectedModelLabel
+            : device.name
+        }}</strong>
+        <small>{{ t("已配对的小米蓝牙语音遥控器") }}</small>
+        <template #trailing>
+          <span
+            class="option-action"
+            :class="{
+              connecting: connectingDeviceId === device.id,
+              connected: isConnectedDevice(device),
+            }"
+          >
+            {{
+              connectingDeviceId === device.id
+                ? t("正在连接…")
+                : isConnectedDevice(device)
+                  ? t("已连接")
+                  : t("连接")
+            }}
+          </span>
+        </template>
+      </OptionCard>
+
+      <StatusRow
+        :state="buttonObserved ? 'ok' : 'pending'"
+        :title="buttonObserved ? t('已收到遥控器按键') : t('等待控制按键')"
+        :desc="buttonRowDesc"
+      />
+    </div>
+
+    <p v-if="connected" class="onboarding-muted">
+      {{ connectedModelLabel || connectedName }} · {{ phaseLabel }}
+    </p>
+
+    <!-- 按错了遥控器：明确说是"另一支"在发按键（2026-10-13 现场），
+         不然界面看起来就是"按了没反应"。 -->
+    <div v-if="otherRemoteActivity && !buttonObserved" class="onboarding-card warn">
+      <h4>{{ t("刚收到的是另一支遥控器的按键") }}</h4>
+      <p v-if="connected">
+        {{ t("当前连接的是「{name}」。请按这一支的普通按键；要用另一支，就点它那一行的「连接」。", { name: connectedModelLabel || connectedName }) }}
+      </p>
+      <p v-else>
+        {{ t("请先在上面点一行「连接」，选中你手上正在按的这一支。") }}
+      </p>
+    </div>
+    <p v-if="reconnecting" class="onboarding-muted">
+      <template v-if="showReconnectGuidance || showResetGuidance">
+        {{ t("正在自动恢复连接（第 {attempt} 次尝试）。", { attempt: reconnectAttempt }) }}
+      </template>
+      <template v-else>
+        {{ t("正在自动恢复连接（第 {attempt} 次尝试），不需要重新配对；超过约 60 秒仍未恢复时，下方会给出排查步骤。", { attempt: reconnectAttempt }) }}
+      </template>
+    </p>
+
+    <!-- issue #104：Windows 只有配对记录、HID 接口缺席时，重连会无限继续。
+         到约 60 秒后给可操作步骤，而不是让用户对着「最多等 60 秒」干等。 -->
+    <div v-if="showReconnectGuidance" class="onboarding-card warn">
+      <h4>{{ t("遥控器还没有真正连上") }}</h4>
+      <p>
+        {{ t("Windows 里可能只有配对记录，蓝牙链路还没有建立；应用会继续自动重试。请按顺序检查：") }}
+      </p>
+      <p v-if="genericRemoteName">
+        {{ t("Windows 报告的遥控器名称是 MI RC，这通常表示它还没有完成初始化，或仍停在上一次的配对状态。") }}
+      </p>
+      <!-- 动作先于长说明（2026-11-06 最小窗口教训）：1066×800 下内容区可能只露出
+           卡片上半部分，按钮必须先可见、不需要先滚动。 -->
+      <div class="onboarding-chips">
+        <button
+          class="onboarding-chip strong"
+          type="button"
+          @click="$emit('openBluetoothSettings')"
+        >
+          {{ t("打开蓝牙设置") }}
+        </button>
+        <button class="onboarding-chip" type="button" :disabled="scanning" @click="$emit('scan')">
+          {{ scanning ? t("正在扫描…") : t("重新扫描") }}
+        </button>
+      </div>
+      <ul class="onboarding-numlist">
+        <li>
+          <span class="onboarding-num">1</span>
+          <span>
+            {{ t("按一下遥控器的普通按键（比如主页键），看上面的「等待控制按键」是否变成「已收到遥控器按键」。") }}
+          </span>
+        </li>
+        <li>
+          <span class="onboarding-num">2</span>
+          <span>
+            {{ t("如果这支遥控器还连着手机或电视，先关掉那些设备的蓝牙；同一支遥控器通常只能同时连接一台设备。") }}
+          </span>
+        </li>
+        <li>
+          <span class="onboarding-num">3</span>
+          <span>
+            {{ t("仍无反应：同时长按「主页」+「菜单」重置遥控器，在 Windows 蓝牙设置里删除这支遥控器，再按「TV」键约 3 秒重新配对；回来后点「重新扫描」。") }}
+          </span>
+        </li>
+      </ul>
+    </div>
+
+    <!-- 2026-11-21 用户澄清：只在已连接但一直收不到按键时提示重置；
+         通用名 MI RC 只决定文案，不代表需要重置（正常工作也可能报这个名字）。 -->
+    <div v-if="showResetGuidance" class="onboarding-card warn">
+      <h4>
+        {{
+          resetGuidanceKind === "not_connected"
+            ? t("遥控器一直没有连上")
+            : resetGuidanceKind === "generic_name"
+              ? t("遥控器连不上或者一直收不到按键")
+              : t("遥控器已连接，但没有收到按键")
+        }}
+      </h4>
+      <div class="onboarding-chips">
+        <button
+          class="onboarding-chip strong"
+          type="button"
+          @click="$emit('openBluetoothSettings')"
+        >
+          {{ t("打开蓝牙设置") }}
+        </button>
+        <button class="onboarding-chip" type="button" :disabled="scanning" @click="$emit('scan')">
+          {{ scanning ? t("正在扫描…") : t("重新扫描") }}
+        </button>
+      </div>
+      <p v-if="resetGuidanceKind === 'not_connected'">
+        {{ t("应用已经自动重试超过约 60 秒，仍没有建立连接。请重置遥控器后重新配对；如果这支遥控器还连着电视或手机，先断开那边的连接。") }}
+      </p>
+      <p v-if="resetGuidanceKind === 'not_connected' && genericRemoteName">
+        {{ t("Windows 报告的遥控器名称是 MI RC，这通常表示它还没有完成初始化，或仍停在上一次的配对状态。") }}
+      </p>
+      <p v-else-if="resetGuidanceKind === 'generic_name'">
+        {{ t("这通常表示遥控器还没有完成初始化，或仍停在上一次的配对状态。请重置遥控器，再从 Windows 重新配对并连接。") }}
+      </p>
+      <p v-else>
+        {{ t("按键可能没有到达 Windows。请重置遥控器后重新配对；如果这支遥控器还连着电视或手机，先断开那边的连接。") }}
+      </p>
+      <ul class="onboarding-numlist">
+        <li>
+          <span class="onboarding-num">1</span>
+          <span>{{ t("在 Windows 蓝牙设置里删除这支遥控器。") }}</span>
+        </li>
+        <li>
+          <span class="onboarding-num">2</span>
+          <span>{{ t("同时长按「主页」+「菜单」直到指示灯快速闪烁——重置遥控器的蓝牙。") }}</span>
+        </li>
+        <li>
+          <span class="onboarding-num">3</span>
+          <span>
+            {{ t("配对完成后回到这里点「重新扫描」，再点设备行右侧的「连接」。") }}
+          </span>
+        </li>
+      </ul>
+    </div>
+
+    <div v-if="voiceKeyMistake && !buttonObserved" class="onboarding-card warn">
+      <h4>{{ t("刚才按的是语音键") }}</h4>
+      <p>{{ t("请按遥控器上除语音键以外的普通按键（比如主页键）。") }}</p>
+    </div>
+
+    <div v-if="fixTitle" class="onboarding-card warn">
+      <h4>{{ fixTitle }}</h4>
+      <!-- 动作先于长说明：1066×800 最小窗口下内容区可能只露出卡片上半部分；
+           把「打开蓝牙设置」放在步骤说明之前，用户不用先滚动才能操作。 -->
+      <div class="onboarding-chips">
+        <button
+          v-if="fixShowsSettings"
+          class="onboarding-chip"
+          :class="{ strong: fixPrefersSettings }"
+          type="button"
+          @click="$emit('openBluetoothSettings')"
+        >
+          {{ t("打开蓝牙设置") }}
+        </button>
+        <button
+          class="onboarding-chip"
+          :class="{ strong: !fixPrefersSettings }"
+          type="button"
+          :disabled="scanning"
+          @click="$emit('scan')"
+        >
+          {{ scanning ? t("正在扫描…") : t("重新扫描") }}
+        </button>
+      </div>
+      <p v-if="gateCode === 'remote.hid_interface_missing'">
+        {{
+          t(
+            "应用已经连上遥控器，但 Windows 还没有提供它的按键通道。先按一下普通按键；仍无反应时，同时长按「主页」+「菜单」重置遥控器，再在蓝牙设置里删除这支遥控器，按「TV」键 3 秒重新配对；还是不行就重启这台电脑（用「重启」，不要用「关机」再开机）。",
+          )
+        }}
+      </p>
+    </div>
+
+    <p v-if="operationMessage" class="onboarding-muted">{{ operationMessage }}</p>
+  </section>
+</template>

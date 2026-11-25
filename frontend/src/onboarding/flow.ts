@@ -1,0 +1,273 @@
+/**
+ * 首次使用向导（Onboarding）流程状态机（纯逻辑：无 UI、无 IPC）。
+ *
+ * 规范来源：Mac 仓 origin/main `feature/first-run-onboarding/PRODUCT_SPEC.md`
+ * 与 Windows 设计稿 `artifacts/design/2026-10-04-onboarding-design.html`：
+ * - 步骤顺序按 D1 确认的 Mac 可见顺序（欢迎 → 遥控器 → 语音设备 → 输入工具
+ *   → 按住说话验证 → 普通按键体验 → 完成）；2026-11-05 在语音设备之后加入
+ *   「全按键支持」说明页（可选增强，不阻断继续；2026-11-21 评估过前置到连接之前，
+ *   最终保持原位——连接页改用“请按返回 / 音量±以外的键”的提示）；
+ * - 每一步「能否继续」都由实时能力状态决定（页面访问与点击不是通过条件）；
+ * - 阻断一律返回稳定失败码（小写 token），供页面显示与结构化日志使用。
+ */
+import type { ConnectionPhase, RawInputPhase, VoiceInputTool } from "../lib/bridge";
+
+export type OnboardingStep =
+  | "welcome"
+  | "remote"
+  | "audio"
+  | "full_key"
+  | "voice_tool"
+  | "voice_test"
+  | "controls"
+  | "complete";
+
+export type OnboardingPhase = "prepare" | "setup" | "try_it";
+
+/** 顺序即导航顺序；不提供「跳过」，完成前没有进入主界面的旁路。 */
+export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
+  "welcome",
+  "remote",
+  "audio",
+  "full_key",
+  "voice_tool",
+  "voice_test",
+  "controls",
+  "complete",
+];
+
+const PHASES: Record<OnboardingStep, OnboardingPhase> = {
+  welcome: "prepare",
+  remote: "setup",
+  audio: "setup",
+  full_key: "setup",
+  voice_tool: "setup",
+  voice_test: "try_it",
+  controls: "try_it",
+  complete: "try_it",
+};
+
+/** 稳定失败码（小写 token，日志安全；设计稿 §7）。 */
+export type OnboardingBlockCode =
+  | "remote.not_connected"
+  | "remote.listener_not_ready"
+  | "remote.hid_interface_missing"
+  | "remote.button_not_ready"
+  | "audio.install_required"
+  | "audio.not_selected"
+  | "audio.not_ready"
+  | "tool.not_selected"
+  | "tool.conflict.vokie_running"
+  | "tool.doubao.authorization_required"
+  | "tool.vokie.not_installed"
+  | "tool.vokie.not_running"
+  | "tool.hotkey_unset"
+  | "voice_test.not_verified"
+  | "controls.not_confirmed"
+  | "complete.runtime_regressed";
+
+export interface StepGate {
+  ok: boolean;
+  code: OnboardingBlockCode | null;
+}
+
+export function isOnboardingStep(value: unknown): value is OnboardingStep {
+  return typeof value === "string" && (ONBOARDING_STEPS as readonly string[]).includes(value);
+}
+
+/** 未知步骤（更旧/更新版本写入）归一化为欢迎，不把用户留在空白页（设计稿 §6）。 */
+export function normalizeStep(value: unknown): OnboardingStep {
+  return isOnboardingStep(value) ? value : "welcome";
+}
+
+export function stepIndex(step: OnboardingStep): number {
+  return ONBOARDING_STEPS.indexOf(step);
+}
+
+export function previousStep(step: OnboardingStep): OnboardingStep | null {
+  const index = stepIndex(step);
+  return index > 0 ? ONBOARDING_STEPS[index - 1] : null;
+}
+
+export function nextStep(step: OnboardingStep): OnboardingStep | null {
+  const index = stepIndex(step);
+  return index >= 0 && index < ONBOARDING_STEPS.length - 1 ? ONBOARDING_STEPS[index + 1] : null;
+}
+
+export function phaseOf(step: OnboardingStep): OnboardingPhase {
+  return PHASES[step];
+}
+
+/**
+ * 阶段进度条的位置（设计稿 2026-10-05：只画位置感，不写步数与百分比）。
+ *
+ * 由导航顺序推导，禁止再维护一份手写映射：2026-11-21 调整步骤顺序时，旧的
+ * `PROGRESS_PERCENT` 没有跟着变，进度条出现过倒退；现在顺序是唯一事实来源。
+ */
+export function stepProgressPercent(step: OnboardingStep): number {
+  const index = stepIndex(step);
+  if (index < 0) return 0;
+  if (ONBOARDING_STEPS.length <= 1) return 100;
+  // 保持设计稿的 4%（第①步）→ 100%（完成）跨度，只按顺序插值。
+  return Math.round(4 + (index / (ONBOARDING_STEPS.length - 1)) * 96);
+}
+
+/** 门禁上下文：由页面从运行快照/设备探测组装，本模块不发起任何调用。 */
+export interface OnboardingContext {
+  remote: {
+    connectionPhase: ConnectionPhase;
+    bleVoiceReady: boolean;
+    rawInputPhase: RawInputPhase;
+    /** 本向导会话里已观察到至少一个普通按键（生产链路）。 */
+    remoteButtonObserved: boolean;
+  };
+  audio: {
+    /** 系统里存在带「推荐」标记的 CABLE 播放端。 */
+    recommendedEndpointAvailable: boolean;
+    /** 当前选择的端点属于推荐集合。 */
+    selectedEndpointRecommended: boolean;
+    wasapiReady: boolean;
+    lastError: string | null;
+  };
+  voiceTool: {
+    tool: VoiceInputTool | null;
+    /** 豆包路径必需：「支持更多输入工具」（全按键支持）已开启且授权完成。 */
+    doubaoCaptureEnabled: boolean;
+    vokieInstalled: boolean;
+    vokieRunning: boolean;
+    /** 「其他工具」的按键已选定（含明确的「不按键」）。 */
+    otherHotkeyChosen: boolean;
+  };
+  voiceTest: {
+    /** 已产生一次终态为通过的验证 attempt（不持久化的已通过标志除外）。 */
+    verified: boolean;
+  };
+  controls: {
+    /** 本向导会话里已观察到的不同普通按键个数。 */
+    distinctButtons: number;
+  };
+}
+
+/** 语音连接处于这些阶段即视为「已连接」（streaming/draining 是按住期间的瞬态）。 */
+export const CONNECTED_PHASES: readonly ConnectionPhase[] = ["ready", "streaming", "draining"];
+
+function pass(): StepGate {
+  return { ok: true, code: null };
+}
+
+function block(code: OnboardingBlockCode): StepGate {
+  return { ok: false, code };
+}
+
+export function evaluateGate(step: OnboardingStep, context: OnboardingContext): StepGate {
+  switch (step) {
+    case "welcome":
+      return pass();
+    case "remote":
+      return evaluateRemote(context.remote);
+    case "full_key":
+      // 全按键支持是可选增强：基础语音与普通按键不依赖系统授权。这里只做说明与
+      // 引导，开关状态不参与「继续」判定（ARM64 等不可用场景也必须能走完向导）。
+      return pass();
+    case "audio":
+      return evaluateAudio(context.audio);
+    case "voice_tool":
+      return evaluateVoiceTool(context.voiceTool);
+    case "voice_test":
+      return context.voiceTest.verified ? pass() : block("voice_test.not_verified");
+    case "controls":
+      return context.controls.distinctButtons >= 3 ? pass() : block("controls.not_confirmed");
+    case "complete":
+      return evaluateComplete(context);
+  }
+  // 未知步骤不应出现（normalizeStep 已兜底）；防御性阻断，并给出可诊断的失败码。
+  return block("complete.runtime_regressed");
+}
+
+function evaluateRemote(remote: OnboardingContext["remote"]): StepGate {
+  if (!CONNECTED_PHASES.includes(remote.connectionPhase) || !remote.bleVoiceReady) {
+    return block("remote.not_connected");
+  }
+  // 已收到按键 = 输入链路事实上可用，这是最终判据。RC003「全按键支持」的边沿
+  // 由提权助手经桥接直接送入映射引擎，不依赖 Raw Input 绑定到 HID 接口；这类
+  // 机器上 Raw Input 可能长期停在 awaiting（现场：matched=0、semantic_edges=198）。
+  // 若先查监听器就绪，界面会一直写「按键监听正在启动」并把「继续」锁死。
+  if (remote.remoteButtonObserved) {
+    return pass();
+  }
+  // 「监听器还在启动」与「监听器在跑、但系统里没有匹配这支遥控器的 HID 接口」
+  // 是两种不同的阻断：前者等一下就好，后者按多少次都不会有按键。2026-11-06 现场
+  // （1.8.0、RC003 已连接、`Raw input: phase=awaiting matched=0 raw_events=0`）
+  // 界面一直写「按键监听正在启动，请稍等一下」，用户没有任何可执行动作。
+  if (remote.rawInputPhase === "awaiting") {
+    return block("remote.hid_interface_missing");
+  }
+  if (remote.rawInputPhase !== "ready") {
+    return block("remote.listener_not_ready");
+  }
+  return block("remote.button_not_ready");
+}
+
+function evaluateAudio(audio: OnboardingContext["audio"]): StepGate {
+  if (!audio.recommendedEndpointAvailable) {
+    return block("audio.install_required");
+  }
+  if (!audio.selectedEndpointRecommended) {
+    return block("audio.not_selected");
+  }
+  if (!audio.wasapiReady || audio.lastError !== null) {
+    return block("audio.not_ready");
+  }
+  return pass();
+}
+
+function evaluateVoiceTool(voiceTool: OnboardingContext["voiceTool"]): StepGate {
+  const tool = voiceTool.tool;
+  if (tool === null) {
+    return block("tool.not_selected");
+  }
+  if (tool === "doubao") {
+    // D4 已确认：同键冲突优先阻断（Vokie 会抢先响应右 Alt），再检查授权状态。
+    if (voiceTool.vokieRunning) {
+      return block("tool.conflict.vokie_running");
+    }
+    if (!voiceTool.doubaoCaptureEnabled) {
+      return block("tool.doubao.authorization_required");
+    }
+    return pass();
+  }
+  if (tool === "vokie") {
+    if (!voiceTool.vokieInstalled) {
+      return block("tool.vokie.not_installed");
+    }
+    if (!voiceTool.vokieRunning) {
+      return block("tool.vokie.not_running");
+    }
+    return pass();
+  }
+  if (tool === "other") {
+    return voiceTool.otherHotkeyChosen ? pass() : block("tool.hotkey_unset");
+  }
+  // 微信输入法：无额外前置（按住约半秒与联网属于工具自身行为说明）。
+  return pass();
+}
+
+function evaluateComplete(context: OnboardingContext): StepGate {
+  // 完成页只重查"关键运行条件是否仍然成立"（连接/音频/工具前置），
+  // 不重验本会话的按键观察等过程证据——那些是各步当时的门禁，不是完成条件。
+  const gates = [
+    evaluateRemoteReady(context.remote),
+    evaluateAudio(context.audio),
+    evaluateVoiceTool(context.voiceTool),
+    context.voiceTest.verified ? pass() : block("voice_test.not_verified"),
+  ];
+  return gates.find((gate) => !gate.ok) ?? pass();
+}
+
+/** 完成页的连接重查：只看连接是否仍就绪，不要求重新按过按键。 */
+function evaluateRemoteReady(remote: OnboardingContext["remote"]): StepGate {
+  if (!CONNECTED_PHASES.includes(remote.connectionPhase) || !remote.bleVoiceReady) {
+    return block("remote.not_connected");
+  }
+  return pass();
+}

@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+node_modules/
+sayall_linux/web/
+
+# Local settings, credentials and runtime files
+.env
+.env.*
+!.env.example
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+
+# Unused nested frontend scratch copies
+/frontend/frontend/

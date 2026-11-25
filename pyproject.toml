@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sayall-linux"
+version = "0.2.7"
+description = "Ubuntu ATVV Bluetooth remote microphone bridge"
+requires-python = ">=3.10"
+dependencies = ["bleak>=0.21,<3", "evdev>=1.6,<2"]
+license = {text = "GPL-3.0-only"}
+
+[project.scripts]
+sayall-linux = "sayall_linux.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["sayall_linux*"]
+
+[tool.setuptools.package-data]
+sayall_linux = ["web/*", "web/**/*"]

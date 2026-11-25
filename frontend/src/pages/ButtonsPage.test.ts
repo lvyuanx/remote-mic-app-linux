@@ -1,0 +1,3778 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
+import ButtonsPage from "./ButtonsPage.vue";
+
+type EdgeHandler = (edge: { button: string; isPressed: boolean }) => void;
+type GestureHandler = (gesture: { button: string; trigger: string }) => void;
+type ShortcutCaptureHandler = (edge: { key: string; isPressed: boolean }) => void;
+
+let edgeHandler: EdgeHandler | null = null;
+let gestureHandler: GestureHandler | null = null;
+let shortcutCaptureHandler: ShortcutCaptureHandler | null = null;
+
+/** 高亮时序取证用的前端日志 spy（保留真实的 reasonToken 等实现）。 */
+const { reportFrontendEventSpy } = vi.hoisted(() => ({
+  reportFrontendEventSpy: vi.fn<(event: Record<string, unknown>) => void>(),
+}));
+
+vi.mock("../lib/frontend-diagnostics", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/frontend-diagnostics")>();
+  return {
+    ...actual,
+    reportFrontendEvent: (event: Record<string, unknown>) => reportFrontendEventSpy(event),
+  };
+});
+
+vi.mock("../lib/bridge", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/bridge")>();
+  return {
+    ...actual,
+    getButtonMappings: vi.fn(async () => ({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "shortcut", chord: { keys: ["enter"] } },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    })),
+    getButtonMappingSnapshot: vi.fn(async () => ({
+      enabled: true,
+      gateActive: true,
+      listenerActive: true,
+      swallowedEdges: 3,
+      leakedDowns: 0,
+      firedGestures: 1,
+      lastFired: null,
+      lastError: null,
+    })),
+    saveButtonMappings: vi.fn(async (mappings: unknown) => mappings),
+    resolvePresetTarget: vi.fn(async () => null),
+    listPresetApps: vi.fn(async () => [
+      { id: "sayall", name: "无线麦 SayAll", installed: true },
+      { id: "wechat", name: "微信", installed: true },
+      { id: "netease_music", name: "网易云音乐", installed: true },
+      { id: "chrome", name: "Chrome 浏览器", installed: true },
+      { id: "chatgpt", name: "ChatGPT", installed: true },
+      { id: "workbuddy", name: "WorkBuddy", installed: true },
+      { id: "dimagent", name: "DimAgent", installed: true },
+      { id: "vokie", name: "Vokie", installed: true },
+      { id: "notepad", name: "记事本", installed: true },
+      { id: "qq", name: "QQ", installed: true },
+    ]),
+    activateAppForLearning: vi.fn(async () => undefined),
+    learnFocusTarget: vi.fn(async () => ({
+      controlType: "Edit",
+      automationId: "chat-input",
+      className: "RichEdit",
+    })),
+    learnFocusPoint: vi.fn(async () => ({
+      xRatio: 0.5,
+      yRatio: 0.82,
+      windowWidth: 1200,
+      windowHeight: 800,
+    })),
+    testAppFocus: vi.fn(async () => undefined),
+    exportButtonMappingConfiguration: vi.fn(async () => true),
+    importButtonMappingConfiguration: vi.fn(async () => ({
+      enabled: false,
+      actions: {
+        power: {
+          single: { type: "shortcut", chord: { keys: ["escape"] } },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    })),
+    resetButtonMappings: vi.fn(async () => ({ enabled: true, actions: {} })),
+    // 组合动作分组候选（2026-10-15）：默认给一条动作，个别用例覆盖为空库。
+    getCombinedActions: vi.fn(async () => ({
+      formatVersion: 1,
+      definitions: [
+        {
+          schemaVersion: "0.1",
+          macroId: "macro.aaaaaaa1",
+          version: "1.0.0",
+          name: "打开记事本并聚焦",
+          steps: [
+            { stepId: "step.01", action: "open_application", parameters: { target: "notepad" } },
+          ],
+        },
+      ],
+    })),
+    scanRegisteredApps: vi.fn(async () => [
+      { name: "Registered Example", path: "shell:AppsFolder\\Example!App" },
+    ]),
+    pickCustomApp: vi.fn(async () => null),
+    testButtonMapping: vi.fn(async () => ({
+      available: true,
+      submittedBatches: 1,
+      submittedEvents: 2,
+      lastError: null,
+    })),
+    subscribeButtonEdges: vi.fn(async (handler: EdgeHandler) => {
+      edgeHandler = handler;
+      return () => {};
+    }),
+    subscribeButtonGestures: vi.fn(async (handler: GestureHandler) => {
+      gestureHandler = handler;
+      return () => {};
+    }),
+    startShortcutCapture: vi.fn(async () => []),
+    stopShortcutCapture: vi.fn(async () => undefined),
+    subscribeShortcutCaptureEdges: vi.fn(async (handler: ShortcutCaptureHandler) => {
+      shortcutCaptureHandler = handler;
+      return () => {};
+    }),
+    // 三键捕获：默认「未授权，开启会触发 UAC」；个别用例用 mockResolvedValue 覆盖。
+    // authorizationRequired 与 Rust enable_capture 的授权判定同源
+    // （任务未注册，或安装/升级写下了重授权标记）。
+    getRc003TaskStatus: vi.fn(async () => ({
+      installed: false,
+      authorizationRequired: true,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    })),
+    enableRc003Capture: vi.fn(async () => ({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    })),
+    disableRc003Capture: vi.fn(async () => ({
+      // 关闭不移除任务：授权保留（与真实语义一致）。
+      installed: true,
+      authorizationRequired: false,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    })),
+    getRc003BridgeSnapshot: vi.fn(async () => ({
+      phase: "stopped",
+      port: 0,
+      helperPid: 0,
+      acceptedTotal: 0,
+      deniedTotal: 0,
+      replacedTotal: 0,
+      edgesApplied: 0,
+      usagesDropped: 0,
+      malformedTotal: 0,
+      watchdogReleaseTotal: 0,
+      pressedUsages: [],
+      lastRxAgeMs: null,
+      targetGeneration: 0,
+      targetUsages: [],
+      ownedUsages: [],
+      captureHealth: "off",
+      captureUnavailable: "none",
+      captureRevoked: "none",
+    })),
+    // 遥控器信息卡片上的「重新连接」：扫描已配对设备 + 连接（默认空列表，用例内按需覆盖）。
+    scanPairedRemotes: vi.fn(async () => []),
+    connectRemote: vi.fn(async () => runtime.platform.connection),
+    // 本机对「全按键支持」的支持情况：默认可用（x64 真机 / 受支持的平台），
+    // 不可用的分支由「全按键支持在本机不可用（issue #206）」用例覆盖。
+    getCaptureSupport: vi.fn(async () => ({
+      nativeArch: "x64" as const,
+      helperExpected: "sayall-helper.exe",
+      available: true,
+      reason: null,
+    })),
+    // 常用语组件可用性：默认不可用（公开构建口径）；可用分支由专门用例覆盖。
+    getCommonPhrasePanelSnapshot: vi.fn(async () => ({
+      available: false,
+      access: "unavailable" as const,
+      canUse: false,
+      notice: null,
+      entries: [],
+    })),
+    // 「锁定当前按键」偏好（2026-10-18 持久化）：默认开启；用例内按需覆盖。
+    getLockMappingSelection: vi.fn(async () => true),
+    saveLockMappingSelection: vi.fn(async (locked: boolean) => locked),
+  };
+});
+
+import {
+  activateAppForLearning,
+  connectRemote,
+  exportButtonMappingConfiguration,
+  getButtonMappings,
+  getButtonMappingSnapshot,
+  getCaptureSupport,
+  getCombinedActions,
+  getCommonPhrasePanelSnapshot,
+  enableRc003Capture,
+  disableRc003Capture,
+  getLockMappingSelection,
+  getRc003BridgeSnapshot,
+  getRc003TaskStatus,
+  importButtonMappingConfiguration,
+  learnFocusPoint,
+  learnFocusTarget,
+  listPresetApps,
+  resolvePresetTarget,
+  pickCustomApp,
+  saveLockMappingSelection,
+  scanPairedRemotes,
+  subscribeButtonEdges,
+  subscribeButtonGestures,
+  saveButtonMappings,
+  startShortcutCapture,
+  stopShortcutCapture,
+} from "../lib/bridge";
+import type {
+  ButtonMappings,
+  CaptureSupport,
+  PairedRemote,
+  Rc003BridgeSnapshot,
+  RuntimeSnapshot,
+} from "../lib/bridge";
+
+const runtime: RuntimeSnapshot = {
+  appVersion: "0.1.0",
+  platform: {
+    platform: "windows",
+    windowsApiAvailable: true,
+    bleScanAvailable: true,
+    bleVoiceReady: true,
+    wasapiReady: false,
+    rawInputReady: true,
+    sendInputReady: true,
+    verificationStatus: "测试",
+    connection: {
+      phase: "ready",
+      remoteName: "小米蓝牙语音遥控器",
+      remoteModel: "rc003",
+      capabilities: null,
+      voiceState: "idle",
+      decodedSamples: 0,
+      generation: 0,
+      reconnectAttempt: 0,
+      powerNotificationsAvailable: false,
+      lastError: null,
+    },
+    audio: {
+      phase: "unsupported",
+      selectedEndpointId: null,
+      selectedEndpointName: null,
+      queuedSamples: 0,
+      submittedSamples: 0,
+      generation: 0,
+      lastError: null,
+    },
+    rawInput: {
+      phase: "ready",
+      matchedDeviceCount: 1,
+      rawEventCount: 0,
+      semanticEdgeCount: 0,
+      lastButton: null,
+      lastIsPressed: null,
+      activeButtons: [],
+      lastError: null,
+      staleRemoteEventCount: 0,
+    },
+    buttonMapping: {
+      enabled: true,
+      gateActive: true,
+      listenerActive: true,
+      swallowedEdges: 3,
+      leakedDowns: 0,
+      firedGestures: 1,
+      lastFired: null,
+      lastError: null,
+    },
+  },
+};
+
+async function mountPage(
+  model: "rc001" | "rc003" | "unknown" = "rc003",
+  initialEditor: { button: "ok"; trigger: "single" | "double" | "long" } | null = null,
+): Promise<VueWrapper> {
+  const snapshot =
+    model === "rc003"
+      ? runtime
+      : {
+          ...runtime,
+          platform: {
+            ...runtime.platform,
+            connection: { ...runtime.platform.connection, remoteModel: model },
+          },
+        };
+  const wrapper = mount(ButtonsPage, { props: { runtime: snapshot, initialEditor } });
+  await vi.waitFor(() => {
+    if (!edgeHandler || !gestureHandler) throw new Error("事件订阅未完成");
+  });
+  mountedPages.push(wrapper);
+  return wrapper;
+}
+
+/** 通过「添加应用」选中 mock 的 Registered Example（自定义应用）。 */
+async function addScannedApp(page: VueWrapper): Promise<void> {
+  if (!page.find(".custom-app-group").exists()) {
+    await page
+      .findAll("button")
+      .find((button) => button.text() === "打开自定义 APP")!
+      .trigger("click");
+    await flushPromises();
+  }
+  await page
+    .findAll("button")
+    .find((button) => button.text() === "添加应用")!
+    .trigger("click");
+  await flushPromises();
+  await page.get('input[aria-label="Registered Example"]').setValue(true);
+  await page.get(".registered-apps-dialog .primary-button").trigger("click");
+  await flushPromises();
+}
+
+/**
+ * 本文件挂载过的页面，用例结束统一卸载。
+ *
+ * 为什么必须卸载：页面里有一个每秒对账的 interval（读任务状态与桥接相位），
+ * 留在挂载态的页面会继续按**当前用例的 mock** 轮询并回写 localStorage 缓存——
+ * 上一用例遗留的开关值（enabled=false）会覆盖本用例刚写下的缓存，制造跨用例
+ * 串扰。2026-10-10 实测：缓存用例偶发读到 { enabled:false, phase:'connected' }
+ * （本文件新增用例改变时序后稳定复现）。
+ */
+const mountedPages: VueWrapper[] = [];
+afterEach(() => {
+  while (mountedPages.length) {
+    const page = mountedPages.pop()!;
+    try {
+      page.unmount();
+    } catch {
+      // 用例里已自行卸载：忽略重复卸载。
+    }
+  }
+  vi.useRealTimers();
+});
+
+beforeEach(() => {
+  edgeHandler = null;
+  gestureHandler = null;
+  shortcutCaptureHandler = null;
+  vi.mocked(getButtonMappings).mockClear();
+  vi.mocked(subscribeButtonEdges).mockClear();
+  vi.mocked(subscribeButtonGestures).mockClear();
+  reportFrontendEventSpy.mockClear();
+  vi.mocked(saveButtonMappings).mockClear();
+  // mockClear 只清调用记录，**不清实现**：学习输入框的默认实现要在每个用例里重置。
+  vi.mocked(activateAppForLearning).mockClear();
+  vi.mocked(activateAppForLearning).mockResolvedValue(undefined);
+  vi.mocked(learnFocusTarget).mockClear();
+  vi.mocked(learnFocusTarget).mockResolvedValue({
+    controlType: "Edit",
+    automationId: "chat-input",
+    className: "RichEdit",
+  });
+  vi.mocked(pickCustomApp).mockClear();
+  vi.mocked(pickCustomApp).mockResolvedValue(null);
+  vi.mocked(resolvePresetTarget).mockResolvedValue(null);
+  vi.mocked(learnFocusPoint).mockClear();
+  vi.mocked(learnFocusPoint).mockResolvedValue({
+    xRatio: 0.5,
+    yRatio: 0.82,
+    windowWidth: 1200,
+    windowHeight: 800,
+  });
+  vi.mocked(exportButtonMappingConfiguration).mockClear();
+  vi.mocked(importButtonMappingConfiguration).mockClear();
+  vi.mocked(startShortcutCapture).mockClear();
+  vi.mocked(stopShortcutCapture).mockClear();
+  // mockClear 只清调用记录，**不清实现**：前面用例留下的 mockRejectedValue /
+  // mockResolvedValue 会渗进后面的用例，必须显式重置。
+  localStorage.clear();
+  vi.mocked(getRc003TaskStatus).mockResolvedValue({
+    installed: false,
+    authorizationRequired: true,
+    enabled: false,
+    helperPath: null,
+    lastError: null,
+  });
+  vi.mocked(enableRc003Capture).mockResolvedValue({
+    installed: true,
+    authorizationRequired: false,
+    enabled: true,
+    helperPath: null,
+    lastError: null,
+  });
+  vi.mocked(disableRc003Capture).mockResolvedValue({
+    installed: true,
+    authorizationRequired: false,
+    enabled: false,
+    helperPath: null,
+    lastError: null,
+  });
+  // 桥接快照同样要重置实现（mockClear 不清实现，见上）。
+  vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(bridgeSnapshot("stopped"));
+  // 「全按键支持」的支持情况同样要重置（默认可用，回归基线）。
+  vi.mocked(getCaptureSupport).mockResolvedValue(SUPPORTED_CAPTURE);
+  // 首帧开关缓存（2026-10-28）：每个用例都从"没有缓存"开始，
+  // 否则上一个用例保存时写进去的值会改变下一个用例首帧的开关状态。
+  localStorage.removeItem("sayall.buttons.switches.v1");
+  // 「重新连接」用的扫描/连接：同样重置实现，避免 mockRejectedValue / 空实现渗进后续用例。
+  vi.mocked(scanPairedRemotes).mockReset();
+  vi.mocked(scanPairedRemotes).mockResolvedValue([]);
+  vi.mocked(connectRemote).mockClear();
+  // 常用语可用性：mockClear 不清实现，显式复位为公开构建口径（不可用）。
+  vi.mocked(getCommonPhrasePanelSnapshot).mockReset();
+  vi.mocked(getCommonPhrasePanelSnapshot).mockResolvedValue({
+    available: false,
+    access: "unavailable",
+    canUse: false,
+    previewMode: false,
+    notice: null,
+    entries: [],
+  });
+  // 「锁定当前按键」偏好（2026-10-18）：同样显式重置实现（mockReset 清实现，再给默认值）。
+  vi.mocked(getLockMappingSelection).mockReset();
+  vi.mocked(getLockMappingSelection).mockResolvedValue(true);
+  vi.mocked(saveLockMappingSelection).mockReset();
+  vi.mocked(saveLockMappingSelection).mockImplementation(async (locked: boolean) => locked);
+});
+
+/** 构造一份指定相位的桥接快照（其余计数字段对 UI 无关，取零值）。 */
+function bridgeSnapshot(
+  phase: Rc003BridgeSnapshot["phase"],
+  captureHealth: Rc003BridgeSnapshot["captureHealth"] = "off",
+  captureRevoked: Rc003BridgeSnapshot["captureRevoked"] = "none",
+  captureUnavailable: Rc003BridgeSnapshot["captureUnavailable"] = "none",
+): Rc003BridgeSnapshot {
+  return {
+    phase,
+    port: 0,
+    helperPid: 0,
+    acceptedTotal: 0,
+    deniedTotal: 0,
+    replacedTotal: 0,
+    edgesApplied: 0,
+    usagesDropped: 0,
+    malformedTotal: 0,
+    watchdogReleaseTotal: 0,
+    pressedUsages: [],
+    lastRxAgeMs: null,
+    targetGeneration: 0,
+    targetUsages: [],
+    ownedUsages: [],
+    captureHealth,
+    captureUnavailable,
+    captureRevoked,
+  };
+}
+
+/** 「全按键支持」所在的开关行（页面有多个 toggle-row，必须按文本定位）。 */
+function captureRow(page: VueWrapper) {
+  return page
+    .findAll(".toggle-row")
+    .filter((row) => row.text().includes("全按键支持"))[0];
+}
+
+/** 2026-09-28 用户定稿：三键关闭态提示（不再带「提示：」前缀）。 */
+const TRI_KEY_HINT = "返回 / 音量+ / 音量−需要开启全按键支持才能使用";
+
+/** 2026-10-03 用户定稿：关闭态三键卡片置灰禁用后的悬停提示。 */
+const TRI_KEY_GATED_TITLE = `${TRI_KEY_HINT}，开启后恢复正常`;
+
+/** 2026-09-28 用户定稿：开关悬停提示随开关状态切换。 */
+const CAPTURE_SWITCH_OFF_TITLE =
+  "开启后支持使用返回 / 音量+ / 音量−，其他按键将同步优化";
+const CAPTURE_SWITCH_ON_TITLE = "关闭后返回 / 音量+ / 音量−将不可映射";
+
+/** 本机支持「全按键支持」（x64 等受支持平台）：回归基线。 */
+const SUPPORTED_CAPTURE: CaptureSupport = {
+  nativeArch: "x64",
+  helperExpected: "sayall-helper.exe",
+  available: true,
+  reason: null,
+};
+
+/** 本机不支持（Windows 11 ARM64，issue #206）：界面必须置灰并说明原因。 */
+const UNSUPPORTED_CAPTURE: CaptureSupport = {
+  nativeArch: "arm64",
+  helperExpected: "sayall-helper-arm64.exe",
+  available: false,
+  reason: "arch_unsupported",
+};
+
+/** 2026-10-07 定稿：本机不可用时的开关悬停提示（原因 + 恢复方式）。 */
+const CAPTURE_UNSUPPORTED_TITLE =
+  "全按键支持在这台电脑上暂不可用；新版本支持后会恢复正常。";
+/** 2026-10-07 定稿：开关旁的短说明（≤ 40 字）。 */
+const CAPTURE_UNSUPPORTED_NOTE = "这台电脑暂不支持全按键支持，其他按键不受影响。";
+/** 2026-10-07 定稿：三键卡片/格子的不可用悬停提示（不写「开启后恢复正常」）。 */
+const TRI_KEY_UNSUPPORTED_TITLE =
+  "返回 / 音量+ / 音量−需要全按键支持；这台电脑暂不支持全按键支持，新版本支持后可配置。";
+
+/** 三键捕获开启前的确认弹窗（未弹出时为 undefined）。 */
+function confirmDialog(page: VueWrapper) {
+  return page
+    .findAll("dialog")
+    .find((dialog) => dialog.classes().includes("capture-confirm-dialog"));
+}
+
+describe("buttons mapping page", () => {
+  it("selecting a scanned app adds it to the library and binds the current button", async () => {
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await addScannedApp(wrapper);
+
+    const saved = vi.mocked(saveButtonMappings).mock.lastCall![0];
+    expect(saved.applications).toEqual([
+      { name: "Registered Example", path: "shell:AppsFolder\\Example!App" },
+    ]);
+    expect(saved.actions.power?.single).toEqual({
+      type: "open_app",
+      target: "shell:AppsFolder\\Example!App",
+    });
+    expect(saved.actions.ok?.single).toEqual({
+      type: "shortcut",
+      chord: { keys: ["enter"] },
+    });
+    wrapper.unmount();
+  });
+
+  it("manual program pick adds it to the library and binds the current action", async () => {
+    vi.mocked(pickCustomApp).mockResolvedValueOnce({
+      name: "Custom",
+      path: "C:\\Apps\\Custom.exe",
+    });
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    if (!wrapper.find(".custom-app-group").exists()) {
+      await wrapper
+        .findAll("button")
+        .find((button) => button.text() === "打开自定义 APP")!
+        .trigger("click");
+      await flushPromises();
+    }
+    await wrapper
+      .findAll("button")
+      .find((button) => button.text() === "添加应用")!
+      .trigger("click");
+    await flushPromises();
+    await wrapper.get(".picker-program-pick").trigger("click");
+    await flushPromises();
+    await wrapper.get(".registered-apps-dialog .primary-button").trigger("click");
+    await vi.waitFor(() =>
+      expect(vi.mocked(saveButtonMappings).mock.lastCall?.[0].actions.power?.single).toEqual({
+        type: "open_app",
+        target: "C:\\Apps\\Custom.exe",
+      }),
+    );
+
+    const saved = vi.mocked(saveButtonMappings).mock.lastCall![0] as ButtonMappings;
+    expect(saved.applications).toContainEqual({
+      name: "Custom",
+      path: "C:\\Apps\\Custom.exe",
+    });
+    wrapper.unmount();
+  });
+
+  it("添加应用入口排在其他应用名称之后，且不再拆成扫描和文件两个按钮", async () => {
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    // 先加一个自定义应用（复用扫描流程），保证「目标 APP」非空。
+    await addScannedApp(wrapper);
+
+    const section = wrapper
+      .findAll(".action-section")
+      .find((item) => item.find(".action-section-title").text() === "打开 APP")!;
+    const chips = section.findAll("button.chip").map((button) => button.text());
+    const customIndex = chips.findIndex((text) => text.includes("Registered Example"));
+    expect(chips).toContain("打开自定义 APP");
+    expect(chips.indexOf("打开自定义 APP")).toBeGreaterThan(
+      chips.indexOf("打开无线麦 SayAll"),
+    );
+    const group = section.find(".custom-app-group");
+    expect(group.exists()).toBe(true);
+    expect(group.find(".target-app-title").text()).toBe("目标 APP");
+    const groupChips = group.findAll("button.chip").map((button) => button.text());
+    expect(customIndex).toBeGreaterThanOrEqual(0);
+    expect(groupChips).toContain("打开 Registered Example");
+    expect(groupChips.at(-1)).toBe("添加应用");
+    // 预设芯片不进入自定义目标组。
+    expect(group.find("button").text()).not.toContain("打开无线麦 SayAll");
+    wrapper.unmount();
+  });
+
+  it("动作分组按用户指定顺序排列，鼠标动作固定在最后（2026-10-22）", async () => {
+    const wrapper = await mountPage();
+    await flushPromises();
+    const downCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "下")!;
+    await downCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    const titles = wrapper.findAll(".mapping-editor .action-section-title").map((item) => item.text());
+    expect(titles.slice(0, 3)).toEqual(["基础按键", "系统与媒体", "自定义动作"]);
+    expect(titles.indexOf("自定义动作")).toBeLessThan(titles.indexOf("打开 APP"));
+    expect(titles.indexOf("打开 APP")).toBeLessThan(titles.indexOf("组合动作"));
+    expect(titles).not.toContain("设备操作");
+    expect(titles.slice(-2)).toEqual(["鼠标动作", "连续执行"]);
+    expect(titles).not.toContain("鼠标滚轮");
+    expect(titles).not.toContain("鼠标点击");
+    expect(titles).not.toContain("鼠标移动");
+
+    // 主分组顺序：自定义动作 → 打开 APP → 组合动作。
+    const customSection = wrapper
+      .findAll(".mapping-editor .action-section")
+      .find((item) => item.find(".action-section-title").text() === "自定义动作")!;
+    const appSection = wrapper
+      .findAll(".mapping-editor .action-section")
+      .find((item) => item.find(".action-section-title").text() === "打开 APP")!;
+    expect(customSection.element.nextElementSibling).toBe(appSection.element);
+
+    // 「连续执行」独立成组，放在鼠标动作下面。
+    const mouseContainer = wrapper.find(".mapping-editor .mouse-action-sections");
+    const repeatContainer = wrapper.find(".mapping-editor .repeat-action-sections");
+    expect(mouseContainer.exists()).toBe(true);
+    expect(repeatContainer.exists(), "方向键应显示「连续执行」").toBe(true);
+    expect(mouseContainer.element.nextElementSibling).toBe(repeatContainer.element);
+    expect(repeatContainer.find(".action-section-title").text()).toBe("连续执行");
+    expect(repeatContainer.findAll(".repeat-options .chip").map((chip) => chip.text())).toEqual([
+      "关闭",
+      "重复单击动作",
+      "重复长按动作",
+    ]);
+    wrapper.unmount();
+  });
+
+  it("鼠标动作合并为一个分组：点击 → 移动 → 滚轮 → 数量输入（2026-10-22）", async () => {
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+    const mouseSection = wrapper
+      .findAll(".mapping-editor .action-section")
+      .find((item) => item.find(".action-section-title").text() === "鼠标动作")!;
+    // 两个可换行的组：点击一组，移动 + 滚轮一组。空间够时并排成一行；
+    // 空间不足时整组换行，正好是用户要求的“下面两行合并”。
+    expect(mouseSection.find(".mouse-action-row").exists()).toBe(true);
+    const groups = mouseSection.findAll(".mouse-action-group");
+    expect(groups).toHaveLength(2);
+    expect(groups[0]!.findAll("button.chip").map((button) => button.text())).toEqual([
+      "左键单击",
+      "右键单击",
+      "左键双击",
+      "中键单击",
+    ]);
+    const lower = groups[1]!.findAll("button.chip");
+    // 2026-10-23 用户要求：四方向显示文字，不再用箭头。
+    expect(lower.slice(0, 4).map((button) => button.text())).toEqual([
+      "鼠标向上",
+      "鼠标向下",
+      "鼠标向左",
+      "鼠标向右",
+    ]);
+    expect(lower.slice(4).map((button) => button.text())).toEqual(["滚轮向上", "滚轮向下"]);
+    // 未选滚轮/移动时不显示数量输入；选滚轮后显示默认 20。
+    expect(mouseSection.find(".mouse-amount").exists()).toBe(false);
+    await lower[4]!.trigger("click");
+    await flushPromises();
+    const amount = mouseSection.find(".mouse-amount");
+    expect(amount.exists()).toBe(true);
+    expect((amount.find("input").element as HTMLInputElement).value).toBe("20");
+    expect(amount.text()).toContain("每次滚动");
+    expect(amount.text()).toContain("格");
+    wrapper.unmount();
+  });
+
+  it("打开应用预设：只展示 2026-10-23 定稿的 10 个且顺序固定", async () => {
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+    const appSection = wrapper
+      .findAll(".mapping-editor .action-section")
+      .find((item) => item.find(".action-section-title").text() === "打开 APP")!;
+    const labels = appSection.findAll("button.chip").map((button) => button.text());
+    expect(labels.slice(0, 10)).toEqual([
+      "打开无线麦 SayAll",
+      "打开微信",
+      "打开网易云音乐",
+      "打开 Chrome 浏览器",
+      "打开 ChatGPT",
+      "打开 WorkBuddy",
+      "打开 DimAgent",
+      "打开 Vokie",
+      "打开记事本",
+      "打开 QQ",
+    ]);
+    for (const removed of ["计算器", "文件资源管理器", "Visual Studio Code", "Cursor", "飞书", "Hermes", "Edge 浏览器"]) {
+      expect(labels).not.toContain(`打开 ${removed}`);
+    }
+    wrapper.unmount();
+  });
+
+  it("「聚焦输入框」并入自定义动作，位于录制按钮右侧（2026-10-22）", async () => {
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    const titles = wrapper.findAll(".mapping-editor .action-section-title").map((item) => item.text());
+    expect(titles, `动作分组：${titles.join(" / ")}`).not.toContain("设备操作");
+    const customSection = wrapper
+      .findAll(".mapping-editor .action-section")
+      .find((item) => item.find(".action-section-title").text() === "自定义动作")!;
+    const rowButtons = customSection
+      .find(".custom-shortcut-row")
+      .findAll("button.chip")
+      .map((button) => button.text());
+    expect(rowButtons).toEqual(["录入自定义快捷键", "聚焦输入框"]);
+    const focusChip = customSection
+      .findAll("button")
+      .find((button) => button.text() === "聚焦输入框");
+    expect(focusChip, "「聚焦输入框」动作入口必须可见").toBeDefined();
+
+    // 选中后写入映射（不切换应用、不输入文字，只有动作类型）。
+    await focusChip!.trigger("click");
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "focus_input",
+    });
+    wrapper.unmount();
+  });
+
+  it("常用语组件不可用时隐藏动作入口，已保存的绑定不被静默替换", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        power: {
+          single: { type: "open_common_phrases" },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    // 按键格摘要：保留该动作并标注当前不可用（不静默替换成别的动作）。
+    expect(powerCard.text()).toContain("打开常用语（当前不可用）");
+
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+    const titles = wrapper.findAll(".mapping-editor .action-section-title").map((item) => item.text());
+    expect(titles, `动作分组：${titles.join(" / ")}`).not.toContain("常用语");
+    expect(
+      wrapper.findAll(".mapping-editor button").some((button) => button.text() === "打开常用语"),
+    ).toBe(false);
+    wrapper.unmount();
+  });
+
+  it("常用语组件可用时提供动作入口，选中后保存为打开常用语", async () => {
+    vi.mocked(getCommonPhrasePanelSnapshot).mockResolvedValue({
+      available: true,
+      access: "allowed",
+      canUse: true,
+      previewMode: false,
+      notice: null,
+      entries: [],
+    });
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    const section = wrapper
+      .findAll(".action-section")
+      .find((item) => item.find(".action-section-title").text() === "常用语")!;
+    expect(section, "组件可用时必须出现「常用语」动作分组").toBeTruthy();
+    const chip = section
+      .findAll("button.chip")
+      .find((button) => button.text().startsWith("打开常用语"))!;
+    expect(chip).toBeTruthy();
+    expect(chip.find(".member-badge").text()).toBe("会员");
+    expect(chip.attributes("disabled")).toBeUndefined();
+    expect(section.find(".common-phrases-cta").exists()).toBe(false);
+    await chip.trigger("click");
+    await flushPromises();
+
+    const saved = vi.mocked(saveButtonMappings).mock.lastCall![0];
+    expect(saved.actions.power?.single).toEqual({ type: "open_common_phrases" });
+    // 选中后按键格摘要显示为可用态（不带「当前不可用」后缀）。
+    expect(powerCard.text()).toContain("打开常用语");
+    expect(powerCard.text()).not.toContain("当前不可用");
+    wrapper.unmount();
+  });
+
+  it("未登录会员时「打开常用语」禁用且不显示会员标识", async () => {
+    vi.mocked(getCommonPhrasePanelSnapshot).mockResolvedValue({
+      available: true,
+      access: "denied",
+      canUse: false,
+      previewMode: false,
+      notice: null,
+      entries: [],
+    });
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((item) => item.find(".mapping-card-title strong").text() === "电源")!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    const section = wrapper
+      .findAll(".action-section")
+      .find((item) => item.find(".action-section-title").text() === "常用语")!;
+    const chip = section
+      .findAll("button.chip")
+      .find((button) => button.text().startsWith("打开常用语"))!;
+    expect(chip.attributes("disabled")).toBeDefined();
+    expect(chip.find(".member-badge").exists()).toBe(false);
+    const cta = section.find(".common-phrases-cta");
+    expect(cta.exists(), "未登录时必须显示「开通 Plus 会员」").toBe(true);
+    await cta.trigger("click");
+    expect(wrapper.emitted("navigate")?.[0]).toEqual(["membership"]);
+    wrapper.unmount();
+  });
+
+  it("renders the remote canvas with 12 button cards, the voice card and 36 trigger cells", async () => {
+    const wrapper = await mountPage();
+    expect(wrapper.findAll(".mapping-card")).toHaveLength(13);
+    expect(wrapper.findAll(".mapping-cell")).toHaveLength(36);
+    const voiceCard = wrapper.find(".voice-card");
+    expect(voiceCard.text()).toContain("语音键");
+    expect(voiceCard.text()).toContain("按住说话");
+  });
+
+  it("does not register listeners or polling after unmounting during initial load", async () => {
+    let resolveMappings!: (value: Awaited<ReturnType<typeof getButtonMappings>>) => void;
+    const pendingMappings = new Promise<Awaited<ReturnType<typeof getButtonMappings>>>(
+      (resolve) => {
+        resolveMappings = resolve;
+      },
+    );
+    vi.mocked(getButtonMappings).mockImplementationOnce(() => pendingMappings);
+    const intervalSpy = vi.spyOn(window, "setInterval");
+
+    const wrapper = mount(ButtonsPage, { props: { runtime } });
+    await flushPromises();
+    wrapper.unmount();
+    resolveMappings({ enabled: true, actions: {} });
+    await flushPromises();
+
+    expect(subscribeButtonEdges).not.toHaveBeenCalled();
+    expect(subscribeButtonGestures).not.toHaveBeenCalled();
+    expect(intervalSpy).not.toHaveBeenCalled();
+    intervalSpy.mockRestore();
+  });
+
+  it("keeps the switches rendered while combined actions are still loading", async () => {
+    // 2026-10-28：`getCombinedActions` 曾在映射赋值之前被 `await`，`listPresetApps`
+    // 也挤在同一条 Promise.all 里（实测 379 ms 探测已安装应用）——两者一起把开关与
+    // 配置内容推迟到一两秒之后。这条用例把它挂在"永不返回"：开关仍必须已经渲染出来，
+    // 否则就是把非首帧数据又塞回首帧链上了。
+    vi.mocked(getCombinedActions).mockReturnValueOnce(new Promise(() => {}) as never);
+
+    const wrapper = mount(ButtonsPage, { props: { runtime } });
+    await flushPromises();
+
+    expect(wrapper.findAll('input[type="checkbox"]').length).toBeGreaterThan(0);
+    wrapper.unmount();
+  });
+
+  it("immediately releases a listener that resolves after the page is unmounted", async () => {
+    let resolveUnlisten!: (unlisten: () => void) => void;
+    const pendingUnlisten = new Promise<() => void>((resolve) => {
+      resolveUnlisten = resolve;
+    });
+    vi.mocked(subscribeButtonEdges).mockImplementationOnce(() => pendingUnlisten);
+    const stopEdges = vi.fn();
+
+    const wrapper = mount(ButtonsPage, { props: { runtime } });
+    await vi.waitFor(() => expect(subscribeButtonEdges).toHaveBeenCalledOnce());
+    const intervalSpy = vi.spyOn(window, "setInterval");
+    wrapper.unmount();
+    resolveUnlisten(stopEdges);
+    await flushPromises();
+
+    expect(stopEdges).toHaveBeenCalledOnce();
+    expect(subscribeButtonGestures).not.toHaveBeenCalled();
+    expect(intervalSpy).not.toHaveBeenCalled();
+    intervalSpy.mockRestore();
+  });
+
+  it("saves, exports and imports a versioned mapping configuration from the footer", async () => {
+    const wrapper = await mountPage();
+    const button = (label: string) =>
+      wrapper.findAll(".mapping-footer button").find((item) => item.text() === label)!;
+
+    await button("保存配置").trigger("click");
+    await vi.waitFor(() => expect(saveButtonMappings).toHaveBeenCalled());
+    await flushPromises();
+    expect(wrapper.text()).toContain("配置已保存并生效");
+
+    await button("导出配置…").trigger("click");
+    await vi.waitFor(() => expect(exportButtonMappingConfiguration).toHaveBeenCalledOnce());
+    expect(wrapper.text()).toContain("按键映射配置已导出");
+
+    await button("导入配置…").trigger("click");
+    await vi.waitFor(() => expect(importButtonMappingConfiguration).toHaveBeenCalledOnce());
+    expect(wrapper.text()).toContain("按键映射配置已导入并生效");
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    expect(powerCard.text()).toContain("Esc");
+  });
+
+  it("marks configured cells and opens the editor with the correct target", async () => {
+    const wrapper = await mountPage();
+    const okCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("确定"));
+    expect(okCard).toBeDefined();
+    expect(okCard!.text()).toContain("Enter");
+
+    const singleCell = okCard!.findAll(".mapping-cell")[0]!;
+    expect(singleCell.classes()).toContain("set");
+    await singleCell.trigger("click");
+    expect(wrapper.find(".mapping-editor").text()).toContain("确定 · 单击");
+  });
+
+  it("组合动作分组：选中即写入 run_macro 并即时保存（2026-10-15）", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("电源"));
+    await powerCard!.findAll(".mapping-cell")[0]!.trigger("click");
+
+    const editor = wrapper.find(".mapping-editor");
+    expect(editor.text()).toContain("组合动作");
+    const macroChip = editor.findAll(".chip").find((chip) => chip.text() === "打开记事本并聚焦");
+    expect(macroChip).toBeTruthy();
+    await macroChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) {
+        throw new Error("自动保存未触发");
+      }
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<
+        string,
+        { single: { type: string; macroId?: string; macroVersion?: string } }
+      >;
+    };
+    expect(saved.actions.power!.single.type).toBe("run_macro");
+    expect(saved.actions.power!.single.macroId).toBe("macro.aaaaaaa1");
+    expect(saved.actions.power!.single.macroVersion).toBe("1.0.0");
+  });
+
+  it("组合动作分组：同一条动作多版本只显示一个芯片（2026-10-15 现场回归）", async () => {
+    vi.mocked(getCombinedActions).mockResolvedValueOnce({
+      formatVersion: 1,
+      definitions: [
+        {
+          schemaVersion: "0.1",
+          macroId: "macro.aaaaaaa1",
+          version: "1.0.0",
+          name: "旧名字",
+          steps: [{ stepId: "step.01", action: "open_application", parameters: { target: "notepad" } }],
+        },
+        {
+          schemaVersion: "0.1",
+          macroId: "macro.aaaaaaa1",
+          version: "1.0.1",
+          name: "新名字",
+          steps: [{ stepId: "step.01", action: "open_application", parameters: { target: "notepad" } }],
+        },
+      ],
+    });
+    const wrapper = await mountPage();
+    const powerCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("电源"));
+    await powerCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const editor = wrapper.find(".mapping-editor");
+    const macroSection = editor.findAll(".action-section").find((section) =>
+      section.text().includes("组合动作"),
+    )!;
+    const chips = macroSection.findAll(".chip");
+    expect(chips.map((chip) => chip.text())).toEqual(["新名字", "管理组合动作"]);
+  });
+
+  it("组合动作分组：空库时保留创建提示，并提供「管理组合动作」入口", async () => {
+    vi.mocked(getCombinedActions).mockResolvedValueOnce({ formatVersion: 1, definitions: [] });
+    const wrapper = await mountPage();
+    const powerCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("电源"));
+    await powerCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const editor = wrapper.find(".mapping-editor");
+    expect(editor.text()).toContain("还没有组合动作。先到“组合动作”页创建。");
+    const manage = editor.findAll(".chip").find((chip) => chip.text() === "管理组合动作");
+    expect(manage, "空库时也应提供管理入口").toBeTruthy();
+    await manage!.trigger("click");
+    expect(wrapper.emitted("navigate")?.[0]).toEqual(["macros"]);
+  });
+
+  it("组合动作分组：有动作时「管理组合动作」排在所有动作之后并跳转组合动作页", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("电源"));
+    await powerCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const macroSection = wrapper
+      .findAll(".mapping-editor .action-section")
+      .find((section) => section.find(".action-section-title").text() === "组合动作")!;
+    const chips = macroSection.findAll(".chip");
+    expect(chips.at(-1)!.text()).toBe("管理组合动作");
+    await chips.at(-1)!.trigger("click");
+    expect(wrapper.emitted("navigate")?.[0]).toEqual(["macros"]);
+  });
+
+  it("applies a preset to the editing target and auto-persists (对齐 Mac 即时保存)", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"));
+    await powerCard!.findAll(".mapping-cell")[2]!.trigger("click");
+
+    const editor = wrapper.find(".mapping-editor");
+    expect(editor.text()).toContain("电源 · 长按");
+    // 点击 Esc 预设即自动保存（无需保存按钮）。
+    const chips = editor.findAll(".chip");
+    const escapeChip = chips.find((chip) => chip.text() === "Esc");
+    await escapeChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) {
+        throw new Error("自动保存未触发");
+      }
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { long: { type: string; chord?: { keys: string[] } } }>;
+    };
+    expect(saved.actions.power!.long.type).toBe("shortcut");
+    expect(saved.actions.power!.long.chord!.keys).toEqual(["escape"]);
+    await flushPromises();
+
+    // 禁用按键按钮：禁用当前格并自动保存。
+    const disableButton = wrapper
+      .findAll("button")
+      .find((button) => button.text() === "禁用按键");
+    expect(disableButton).toBeDefined();
+    await disableButton!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length < 2) {
+        throw new Error("禁用后未自动保存");
+      }
+    });
+    const disabledSaved = vi.mocked(saveButtonMappings).mock.calls[1]![0] as {
+      actions: Record<string, { long: { type: string } }>;
+    };
+    expect(disabledSaved.actions.power!.long.type).toBe("disabled");
+  });
+
+  it("「按住时连续执行」：选“重复单击动作”写入 holdRepeat=single，改回“关闭”清空", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["delete"] } },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const chip = (label: string) =>
+      wrapper
+        .find(".mapping-editor")
+        .findAll(".repeat-options .chip")
+        .find((item) => item.text() === label);
+
+    // 默认“关闭”选中；单击动作可连续 → “重复单击动作”可选。
+    expect(wrapper.find(".mapping-editor .repeat-options .chip.selected").text()).toBe("关闭");
+    expect((chip("重复单击动作")!.element as HTMLButtonElement).disabled).toBe(false);
+
+    await chip("重复单击动作")!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未自动保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { holdRepeat?: string }>;
+    };
+    expect(saved.actions.up!.holdRepeat).toBe("single");
+    expect(wrapper.find(".mapping-editor .repeat-options .chip.selected").text()).toBe(
+      "重复单击动作",
+    );
+
+    // 改回“关闭”：负载里不再带 holdRepeat（先等上一轮保存结束、busy 释放）。
+    await vi.waitFor(() => {
+      if ((chip("关闭")!.element as HTMLButtonElement).disabled) throw new Error("等待保存结束");
+    });
+    await chip("关闭")!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length < 2) throw new Error("关闭未保存");
+    });
+    const off = vi.mocked(saveButtonMappings).mock.calls[1]![0] as {
+      actions: Record<string, { holdRepeat?: string }>;
+    };
+    expect(off.actions.up!.holdRepeat).toBeUndefined();
+  });
+
+  it("「按住时连续执行」：长按动作未配置时“重复长按动作”置灰，配置后可选中并保存 long", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["delete"] } },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[2]!.trigger("click");
+    const chip = (label: string) =>
+      wrapper
+        .find(".mapping-editor")
+        .findAll(".repeat-options .chip")
+        .find((item) => item.text() === label);
+    expect(wrapper.find(".mapping-editor").text()).toContain("先给这个按键配置长按动作");
+    expect((chip("重复长按动作")!.element as HTMLButtonElement).disabled).toBe(true);
+
+    // 选择可连续执行的长按动作（Backspace）后该选项可用。
+    const backspaceChip = wrapper
+      .find(".mapping-editor")
+      .findAll(".chip")
+      .find((item) => item.text() === "Backspace");
+    await backspaceChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("长按动作未保存");
+    });
+    await vi.waitFor(() => {
+      const pending = chip("重复长按动作")!;
+      if ((pending.element as HTMLButtonElement).disabled) {
+        throw new Error("选择可连续的长按动作后该选项应可用");
+      }
+    });
+    await chip("重复长按动作")!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length < 2) throw new Error("选项未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[1]![0] as {
+      actions: Record<string, { holdRepeat?: string }>;
+    };
+    expect(saved.actions.up!.holdRepeat).toBe("long");
+  });
+
+  it("「按住时连续执行」：已选“重复单击动作”后再配置长按 → 自动回到“关闭”并提示", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["delete"] } },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+          holdRepeat: "single",
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[2]!.trigger("click");
+    const backspaceChip = wrapper
+      .find(".mapping-editor")
+      .findAll(".chip")
+      .find((item) => item.text() === "Backspace");
+    await backspaceChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { holdRepeat?: string }>;
+    };
+    expect(saved.actions.up!.holdRepeat).toBeUndefined();
+    await vi.waitFor(() => {
+      const status = wrapper.find(".mapping-status");
+      if (!status.exists()) throw new Error("提示尚未展示");
+      if (!status.text().includes("已关闭")) throw new Error("提示未说明已被关闭");
+      if (!status.text().includes("重复长按动作")) throw new Error("提示未给出下一步");
+    });
+  });
+
+  it("前向兼容：未知动作不会让「按住时连续执行」被自动清掉", async () => {
+    // 新版本写入的未知动作当前版本不执行，但也不能在用户改同一按键的
+    // 其它格子时把 holdRepeat 一并清掉——那会在保存时丢数据。
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      schemaVersion: 9,
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "future_action", foo: 1 },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+          holdRepeat: "single",
+        },
+      },
+    } as unknown as ButtonMappings);
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    // 编辑双击格，只改双击；单击的未知动作与 holdRepeat 必须原样保留。
+    await upCard!.findAll(".mapping-cell")[1]!.trigger("click");
+    const backspaceChip = wrapper
+      .find(".mapping-editor")
+      .findAll(".chip")
+      .find((item) => item.text() === "Backspace");
+    await backspaceChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { single?: { type?: string }; holdRepeat?: string }>;
+    };
+    expect(saved.actions.up!.single?.type).toBe("future_action");
+    expect(saved.actions.up!.holdRepeat).toBe("single");
+  });
+
+  it("前向兼容：未知动作需要二次选择才会被替换", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      schemaVersion: 9,
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "future_action", foo: 1 },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    } as unknown as ButtonMappings);
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const backspaceChip = () =>
+      wrapper
+        .find(".mapping-editor")
+        .findAll(".chip")
+        .find((item) => item.text() === "Backspace");
+    await backspaceChip()!.trigger("click");
+    expect(saveButtonMappings).not.toHaveBeenCalled();
+    expect(wrapper.text()).toContain("再次选择任意动作将替换它");
+
+    await backspaceChip()!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as ButtonMappings;
+    expect(saved.actions.up!.single).toEqual({
+      type: "shortcut",
+      chord: { keys: ["backspace"] },
+    });
+  });
+
+  it("前向兼容：未知长按动作不会让单击的 holdRepeat 被自动清掉", async () => {
+    // 更高版本可能新增长按动作。当前版本无法判断它是否与
+    // holdRepeat=single 冲突，必须保留用户已有的选择。
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      schemaVersion: 9,
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["delete"] } },
+          double: { type: "disabled" },
+          long: { type: "future_long_action" },
+          holdRepeat: "single",
+        },
+      },
+    } as unknown as ButtonMappings);
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[1]!.trigger("click");
+    const backspaceChip = wrapper
+      .find(".mapping-editor")
+      .findAll(".chip")
+      .find((item) => item.text() === "Backspace");
+    await backspaceChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { long?: { type?: string }; holdRepeat?: string }>;
+    };
+    expect(saved.actions.up!.long?.type).toBe("future_long_action");
+    expect(saved.actions.up!.holdRepeat).toBe("single");
+  });
+
+  it("前向兼容：未知长按不能掩盖无效的单击 holdRepeat", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      schemaVersion: 9,
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "disabled" },
+          double: { type: "disabled" },
+          long: { type: "future_long_action" },
+          holdRepeat: "single",
+        },
+      },
+    } as unknown as ButtonMappings);
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[1]!.trigger("click");
+    const backspaceChip = wrapper
+      .find(".mapping-editor")
+      .findAll(".chip")
+      .find((item) => item.text() === "Backspace");
+    await backspaceChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { holdRepeat?: string }>;
+    };
+    expect(saved.actions.up!.holdRepeat).toBeUndefined();
+  });
+
+  it("「按住时连续执行」：所有按键单/长按页显示，组合键置灰，双击页不显示", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["control", "c"] } },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const findCard = (label: string) =>
+      wrapper.findAll(".mapping-card").find((card) => card.text().includes(label))!;
+
+    // 确定键：也显示「连续执行」，但未配置单击动作时选项置灰并说明原因。
+    await findCard("确定").findAll(".mapping-cell")[0]!.trigger("click");
+    expect(wrapper.find(".mapping-editor .repeat-group").exists()).toBe(true);
+    expect(wrapper.find(".mapping-editor").text()).toContain("先给这个按键配置单击动作");
+
+    // 方向键 + 组合键动作：“重复单击动作”置灰并说明原因。
+    await findCard("上").findAll(".mapping-cell")[0]!.trigger("click");
+    const chip = wrapper
+      .find(".mapping-editor")
+      .findAll(".repeat-options .chip")
+      .find((item) => item.text() === "重复单击动作");
+    expect(chip).toBeDefined();
+    expect((chip!.element as HTMLButtonElement).disabled).toBe(true);
+    expect(wrapper.find(".mapping-editor").text()).toContain("只执行一次");
+
+    // 双击页不提供该选项组。
+    await findCard("上").findAll(".mapping-cell")[1]!.trigger("click");
+    expect(wrapper.find(".mapping-editor .repeat-group").exists()).toBe(false);
+  });
+
+  it("「按住时连续执行」：TV 配置可连续执行的鼠标动作后可以开启", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        tv: {
+          single: { type: "mouse_move", direction: "up", distance: 1 },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const tvCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("TV"))!;
+    await tvCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const group = wrapper.find(".mapping-editor .repeat-group");
+    expect(group.exists(), "TV 也应显示「连续执行」").toBe(true);
+    const chip = group
+      .findAll(".repeat-options .chip")
+      .find((item) => item.text() === "重复单击动作")!;
+    expect((chip.element as HTMLButtonElement).disabled).toBe(false);
+    await chip.trigger("click");
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.tv!.holdRepeat).toBe("single");
+  });
+
+  it("「按住时连续执行」：单击与长按并存时“重复单击动作”置灰并指向“重复长按动作”", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["delete"] } },
+          double: { type: "disabled" },
+          long: { type: "shortcut", chord: { keys: ["backspace"] } },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const chip = (label: string) =>
+      wrapper
+        .find(".mapping-editor")
+        .findAll(".repeat-options .chip")
+        .find((item) => item.text() === label);
+    expect((chip("重复单击动作")!.element as HTMLButtonElement).disabled).toBe(true);
+    expect(wrapper.find(".mapping-editor").text()).toContain("请选“重复长按动作”");
+    expect(chip("重复单击动作")!.attributes("title")).toBe(
+      "这个按键已有长按动作，按住会先执行长按；要连续执行，请选“重复长按动作”",
+    );
+    expect((chip("重复长按动作")!.element as HTMLButtonElement).disabled).toBe(false);
+    expect(chip("重复长按动作")!.attributes("title")).toBe(
+      "按住约 0.55 秒后，长按动作会不断重复，直到松手",
+    );
+  });
+
+  it("说明文案：编辑区底部不再显示单击/长按/双击提示，行为说明只在选项悬停里", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["delete"] } },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    const chip = (label: string) =>
+      wrapper
+        .find(".mapping-editor")
+        .findAll(".repeat-options .chip")
+        .find((item) => item.text() === label);
+    await upCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const editorText = wrapper.find(".mapping-editor").text();
+    expect(editorText).not.toContain("单击在按下瞬间执行");
+    expect(editorText).not.toContain("长按约 0.55 秒后执行");
+    expect(editorText).not.toContain("双击不会连续执行");
+    expect(chip("重复单击动作")!.attributes("title")).toBe(
+      "按住不放，单击动作会不断重复，直到松手",
+    );
+    await upCard!.findAll(".mapping-cell")[2]!.trigger("click");
+    // 未配置长按动作：该选项置灰，悬停显示原因而不是行为说明。
+    expect(chip("重复长按动作")!.attributes("title")).toBe("先给这个按键配置长按动作");
+  });
+
+  it("说明文案：已配置双击时，「重复单击动作」悬停切换为按住确认口径", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["delete"] } },
+          double: { type: "shortcut", chord: { keys: ["space"] } },
+          long: { type: "disabled" },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    expect(wrapper.find(".mapping-editor").text()).not.toContain(
+      "配置了双击：单击会稍等片刻（约 0.3 秒）以区分双击",
+    );
+    const chip = wrapper
+      .find(".mapping-editor")
+      .findAll(".repeat-options .chip")
+      .find((item) => item.text() === "重复单击动作");
+    expect(chip!.attributes("title")).toBe(
+      "按住超过约 0.3 秒开始，单击动作会不断重复，直到松手",
+    );
+  });
+
+  it("「按住时连续执行」：长按动作只执行一次时，两句提示不指向灰掉的选项", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["delete"] } },
+          double: { type: "disabled" },
+          long: { type: "open_app", target: "shell:AppsFolder\\Example!App" },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    // 单击页：两个选项都不可选，提示给出“先清除长按动作”这条真正可行的下一步。
+    await upCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const singleHint = wrapper.find(".mapping-editor").text();
+    expect(singleHint).toContain("请先清除长按动作");
+    expect(singleHint).not.toContain("请选“重复长按动作”");
+    // 长按页：原因不变，且说明句不再承诺“开启后会连续执行”。
+    await upCard!.findAll(".mapping-cell")[2]!.trigger("click");
+    const longHint = wrapper.find(".mapping-editor").text();
+    expect(longHint).toContain("“长按”的动作只执行一次");
+    expect(longHint).not.toContain("请选“重复长按动作”");
+    expect(longHint).not.toContain("开启“按住时连续执行”后");
+  });
+
+  it("「按住时连续执行」：选“重复单击动作”后配置不可重复的长按 → 提示不指向灰选项", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["delete"] } },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+          holdRepeat: "single",
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const upCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("上"));
+    await upCard!.findAll(".mapping-cell")[2]!.trigger("click");
+    const appChip = wrapper
+      .find(".mapping-editor")
+      .findAll(".chip")
+      .find((item) => item.text() === "打开记事本");
+    await appChip!.trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { holdRepeat?: string }>;
+    };
+    expect(saved.actions.up!.holdRepeat).toBeUndefined();
+    await vi.waitFor(() => {
+      const status = wrapper.find(".mapping-status");
+      if (!status.exists()) throw new Error("提示尚未展示");
+      if (!status.text().includes("已关闭")) throw new Error("提示未说明已被关闭");
+      if (status.text().includes("请选“重复长按动作”")) {
+        throw new Error("提示不得指向灰掉的选项");
+      }
+    });
+  });
+
+  it("「移动光标后按 OK 点击」：只出现在 OK 键，开启/关闭写入 okContextClick", async () => {
+    const wrapper = await mountPage();
+    const findCard = (label: string) =>
+      wrapper.findAll(".mapping-card").find((card) => card.text().includes(label))!;
+    const toggle = () => wrapper.find(".mapping-editor .ok-click-toggle input");
+
+    // 只对 OK 键显示。
+    await findCard("上").findAll(".mapping-cell")[0]!.trigger("click");
+    expect(wrapper.find(".mapping-editor .ok-click-toggle").exists()).toBe(false);
+
+    // 说明句写明 5 秒窗口与“原动作都不执行”。
+    await findCard("确定").findAll(".mapping-cell")[0]!.trigger("click");
+    expect(wrapper.find(".mapping-editor .ok-click-toggle").exists()).toBe(true);
+    expect(wrapper.find(".mapping-editor").text()).toContain("刚用遥控器移动过光标（5 秒内）");
+    expect(wrapper.find(".mapping-editor").text()).toContain("单击、双击、长按都不会执行");
+    expect((toggle().element as HTMLInputElement).disabled).toBe(false);
+
+    await toggle().setValue(true);
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length === 0) throw new Error("未保存");
+    });
+    const saved = vi.mocked(saveButtonMappings).mock.calls[0]![0] as {
+      actions: Record<string, { okContextClick?: boolean }>;
+    };
+    expect(saved.actions.ok!.okContextClick).toBe(true);
+
+    // 长按页显示同一开关（按键级）；双击页不显示。
+    await findCard("确定").findAll(".mapping-cell")[2]!.trigger("click");
+    expect(wrapper.find(".mapping-editor .ok-click-toggle").exists()).toBe(true);
+    await findCard("确定").findAll(".mapping-cell")[1]!.trigger("click");
+    expect(wrapper.find(".mapping-editor .ok-click-toggle").exists()).toBe(false);
+
+    // 关闭：先等上一轮保存结束（busy 释放），再清空字段。
+    await findCard("确定").findAll(".mapping-cell")[0]!.trigger("click");
+    await vi.waitFor(() => {
+      if ((toggle().element as HTMLInputElement).disabled) throw new Error("等待保存结束");
+    });
+    expect((toggle().element as HTMLInputElement).checked).toBe(true);
+    await toggle().setValue(false);
+    await vi.waitFor(() => {
+      if (vi.mocked(saveButtonMappings).mock.calls.length < 2) throw new Error("关闭未保存");
+    });
+    const off = vi.mocked(saveButtonMappings).mock.calls[1]![0] as {
+      actions: Record<string, { okContextClick?: boolean }>;
+    };
+    expect(off.actions.ok!.okContextClick).toBeUndefined();
+    await vi.waitFor(() => {
+      if (!wrapper.find(".mapping-status").text().includes("已关闭")) {
+        throw new Error("缺少关闭提示");
+      }
+    });
+  });
+
+  it("预设不显示聚焦摘要，自定义 APP 显示聚焦与翻页状态并可去配置", async () => {
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const editor = wrapper.find(".mapping-editor");
+
+    // 预设应用：内置聚焦与翻页，不在按键页显示可编辑配置或摘要。
+    await editor.findAll(".chip").find((item) => item.text() === "打开记事本")!.trigger("click");
+    await flushPromises();
+    expect(editor.find(".focus-profile-summary").exists()).toBe(false);
+
+    // 自定义 APP：展开目标 APP，添加后显示聚焦与翻页状态。
+    expect(editor.find(".custom-app-group").exists()).toBe(false);
+    await editor
+      .findAll("button")
+      .find((button) => button.text() === "打开自定义 APP")!
+      .trigger("click");
+    await flushPromises();
+    expect(editor.find(".custom-app-group .target-app-title").text()).toBe("目标 APP");
+    await addScannedApp(wrapper);
+    expect(editor.find(".focus-profile-summary").text()).toContain("聚焦：");
+    expect(editor.find(".focus-profile-summary").text()).toContain("翻页：需学习");
+    // 可写控件不得再出现在按键页。
+    expect(editor.find(".focus-strategy-option").exists()).toBe(false);
+    expect(editor.find(".focus-shortcut-value").exists()).toBe(false);
+
+    // 「去配置」带目标跳到 APP 适配页。
+    await editor.find(".focus-profile-summary .link-button").trigger("click");
+    expect(wrapper.emitted("navigate")?.at(-1)).toEqual([
+      { page: "apps", params: { appTarget: "shell:AppsFolder\\Example!App" } },
+    ]);
+  });
+
+  it("built-in preset with a learned click position shows the summary and a configure entry", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target: "wechat" },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      focusProfiles: {
+        wechat: {
+          strategy: "recorded_point",
+          point: {
+            xRatio: 0.5,
+            yRatio: 0.82,
+            windowWidth: 1200,
+            windowHeight: 800,
+          },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("记录点击位置");
+    expect(summary.find(".link-button").text()).toBe("去配置");
+    await summary.find(".link-button").trigger("click");
+    expect(wrapper.emitted("navigate")?.at(-1)).toEqual([
+      { page: "apps", params: { appTarget: "wechat" } },
+    ]);
+  });
+
+  it("AppsFolder 预设目标同步聚焦与翻页记录", async () => {
+    const target = "shell:AppsFolder\\Chrome";
+    vi.mocked(resolvePresetTarget).mockImplementation(async (value) =>
+      value === target ? "chrome" : null,
+    );
+    vi.mocked(listPresetApps).mockResolvedValueOnce([
+      {
+        id: "chrome",
+        name: "Chrome 浏览器",
+        installed: true,
+        path: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      },
+    ]);
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ name: "Google Chrome", path: target }],
+      focusProfiles: { chrome: { strategy: "auto_composer" } },
+      scrollRegions: {
+        chrome: {
+          controlType: "Document",
+          normalizedRect: { x: 0, y: 0.1, width: 1, height: 0.8 },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("聚焦：自动选择输入框");
+    expect(summary.text()).toContain("翻页：已学习");
+    expect(summary.find(".link-button").text()).toBe("去配置");
+    wrapper.unmount();
+  });
+
+  it("AppsFolder 预设目标优先读取目标键下的显式记录", async () => {
+    const target = "shell:AppsFolder\\WorkBuddy.WorkBuddy";
+    vi.mocked(resolvePresetTarget).mockImplementation(async (value) =>
+      value === target ? "workbuddy" : null,
+    );
+    vi.mocked(listPresetApps).mockResolvedValueOnce([
+      {
+        id: "workbuddy",
+        name: "WorkBuddy",
+        installed: true,
+        path: "C:\\Program Files\\WorkBuddy\\WorkBuddy.exe",
+      },
+    ]);
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ name: "WorkBuddy", path: target }],
+      focusProfiles: {
+        [target]: {
+          strategy: "app_shortcut",
+          recorded: {
+            controlType: "Edit",
+            automationId: "",
+            className: "",
+            normalizedRect: { x: 0.3, y: 0.8, width: 0.6, height: 0.08 },
+          },
+        },
+      },
+      scrollRegions: {
+        [target]: {
+          controlType: "Window",
+          normalizedRect: { x: 0, y: 0, width: 1, height: 1 },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("聚焦：使用 APP 快捷键聚焦");
+    expect(summary.text()).toContain("翻页：已学习");
+    expect(summary.find(".link-button").text()).toBe("去配置");
+    wrapper.unmount();
+  });
+
+  it("手动添加的预设显示预置能力，并保留去配置入口", async () => {
+    const target = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+    vi.mocked(listPresetApps).mockResolvedValueOnce([
+      { id: "chrome", name: "Chrome 浏览器", installed: true, path: target },
+    ]);
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ name: "Chrome", path: target }],
+      focusProfiles: {},
+    });
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    const summary = wrapper.find(".focus-profile-summary");
+    expect(summary.text()).toContain("使用 APP 快捷键聚焦");
+    expect(summary.text()).toContain("翻页：预置可用");
+    expect(summary.find(".link-button").text()).toBe("去配置");
+    wrapper.unmount();
+  });
+
+  it("keeps the last focus failure visible beside the read-only summary", async () => {
+    const target = "C:\\Tools\\Example.exe";
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ path: target, name: "Example" }],
+      focusProfiles: { [target]: { strategy: "recorded_element" } },
+    });
+    vi.mocked(getButtonMappingSnapshot).mockResolvedValueOnce({
+      enabled: true,
+      gateActive: true,
+      listenerActive: true,
+      swallowedEdges: 0,
+      leakedDowns: 0,
+      firedGestures: 0,
+      lastFired: null,
+      lastError: null,
+      lastFocus: { focused: false, reason: "no_candidate" },
+    } as never);
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.text()).toContain("上次聚焦失败：没有找到可用的输入框");
+  });
+
+  it("opens the requested button editor from a navigation request", async () => {
+    const wrapper = await mountPage("rc003", { button: "ok", trigger: "long" });
+    await flushPromises();
+    expect(wrapper.find(".mapping-editor").text()).toContain("确定 · 长按");
+  });
+
+  it("自定义应用的聚焦摘要显示已保存的策略", async () => {
+    const target = "C:\\Tools\\Example.exe";
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        ok: {
+          single: { type: "open_app", target },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+      applications: [{ path: target, name: "Example" }],
+      focusProfiles: {
+        [target]: { strategy: "app_shortcut", shortcut: { keys: ["left_control", "k"] } },
+      },
+    });
+    const wrapper = await mountPage();
+    const okCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("确定"));
+    await okCard!.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".focus-profile-summary").text()).toContain("使用 APP 快捷键聚焦");
+    expect(wrapper.find(".focus-profile-summary .link-button").text()).toBe("去配置");
+  });
+
+
+
+
+
+
+
+  it("configures mouse actions; wheel and move accept 1–100 and save on Enter or blur", async () => {
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const choose = async (label: string) => {
+      await wrapper
+        .findAll(".mapping-editor button")
+        .find((button) => button.text() === label)!
+        .trigger("click");
+      await flushPromises();
+    };
+
+    await choose("滚轮向下");
+    let wheelInput = wrapper.get('input[aria-label="每次滚动格数"]');
+    // 普通文本框，不再带数字框的上下加减按钮；默认 20。
+    expect(wheelInput.attributes("type")).toBe("text");
+    expect((wheelInput.element as HTMLInputElement).value).toBe("20");
+    // 保存说明只跟在「每次移动…像素」后面；滚轮状态不显示。
+    expect(wrapper.find(".mouse-amount-hint").exists()).toBe(false);
+
+    // 2026-10-22 现场回归：App 每秒刷新运行状态会触发重渲染，正在输入的值
+    // 不得被配置值覆盖回默认 20。
+    await wheelInput.setValue("77");
+    await wrapper.setProps({ runtime: { ...runtime, appVersion: "0.1.1" } });
+    await flushPromises();
+    wheelInput = wrapper.get('input[aria-label="每次滚动格数"]');
+    expect((wheelInput.element as HTMLInputElement).value).toBe("77");
+    await wheelInput.setValue("5");
+    await wheelInput.trigger("blur");
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "scroll",
+      direction: "down",
+      steps: 5,
+    });
+    // 2026-10-22 用户定稿：1–100，100 是上限；Enter 提交。
+    const savesBeforeEnter = vi.mocked(saveButtonMappings).mock.calls.length;
+    await wheelInput.setValue("100");
+    await wheelInput.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "scroll",
+      direction: "down",
+      steps: 100,
+    });
+    // Enter 已保存后再次失焦不应重复写盘。
+    await wheelInput.trigger("blur");
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(savesBeforeEnter + 1);
+
+    // 0 与 101 无效：不保存，并提示 1–100。
+    const saveCount = vi.mocked(saveButtonMappings).mock.calls.length;
+    for (const invalid of ["0", "101"]) {
+      await wheelInput.setValue(invalid);
+      await wheelInput.trigger("keydown", { key: "Enter" });
+      await flushPromises();
+      expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(saveCount);
+      // 错误提示贴在输入框下方，不再出现在页面最下方。
+      expect(wrapper.get(".mouse-amount-error").text()).toBe("请输入 1 到 100 之间的整数");
+      const bottom = wrapper.find(".mapping-status");
+      expect(bottom.exists() ? bottom.text() : "").not.toContain("请输入 1 到 100 之间的整数");
+    }
+
+    // 鼠标移动沿用同一口径：1–100、默认 20，Enter/失焦都保存。
+    await wrapper
+      .find('.mapping-editor button[aria-label="鼠标向右"]')
+      .trigger("click");
+    await flushPromises();
+    let moveInput = wrapper.get('input[aria-label="每次移动像素"]');
+    expect(moveInput.attributes("type")).toBe("text");
+    expect((moveInput.element as HTMLInputElement).value).toBe("20");
+    expect(wrapper.get(".mouse-amount-hint").text()).toBe(
+      "请输入 1 到 100 之间的整数，并按Enter或鼠标点击空白处保存配置。",
+    );
+    await moveInput.setValue("77");
+    await wrapper.setProps({ runtime: { ...runtime, appVersion: "0.1.2" } });
+    await flushPromises();
+    moveInput = wrapper.get('input[aria-label="每次移动像素"]');
+    expect((moveInput.element as HTMLInputElement).value).toBe("77");
+    await moveInput.setValue("100");
+    await moveInput.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "mouse_move",
+      direction: "right",
+      distance: 100,
+    });
+    expect(wrapper.find(".mouse-amount-error").exists()).toBe(false);
+    const movesBeforeInvalid = vi.mocked(saveButtonMappings).mock.calls.length;
+    await moveInput.setValue("101");
+    await moveInput.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.calls).toHaveLength(movesBeforeInvalid);
+    expect(wrapper.get(".mouse-amount-error").text()).toBe("请输入 1 到 100 之间的整数");
+    const bottom = wrapper.find(".mapping-status");
+    expect(bottom.exists() ? bottom.text() : "").not.toContain("请输入 1 到 100 之间的整数");
+    // 再次点击输入框：错误提示收回，恢复输入提示。
+    moveInput = wrapper.get('input[aria-label="每次移动像素"]');
+    await moveInput.trigger("focus");
+    expect(wrapper.find(".mouse-amount-error").exists()).toBe(false);
+    expect(wrapper.get(".mouse-amount-hint").text()).toBe(
+      "请输入 1 到 100 之间的整数，并按Enter或鼠标点击空白处保存配置。",
+    );
+
+    await choose("左键双击");
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "mouse_click",
+      kind: "double_left",
+    });
+    wrapper.unmount();
+  });
+
+  it("legacy scroll action without steps: explicitly entering 20 persists it (2026-10-22)", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        power: {
+          single: { type: "scroll", direction: "down" },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    await flushPromises();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await flushPromises();
+    const input = wrapper.get('input[aria-label="每次滚动格数"]');
+    expect((input.element as HTMLInputElement).value).toBe("20");
+    await input.setValue("20");
+    await input.trigger("keydown", { key: "Enter" });
+    await flushPromises();
+    expect(vi.mocked(saveButtonMappings).mock.lastCall![0].actions.power!.single).toEqual({
+      type: "scroll",
+      direction: "down",
+      steps: 20,
+    });
+    wrapper.unmount();
+  });
+
+  it("records a physical Win+L chord directly by default", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const captureButton = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((button) => button.text().includes("录入自定义快捷键"))!;
+    await captureButton.trigger("click");
+
+    shortcutCaptureHandler!({ key: "left_windows", isPressed: true });
+    shortcutCaptureHandler!({ key: "l", isPressed: true });
+    shortcutCaptureHandler!({ key: "l", isPressed: false });
+    await flushPromises();
+    expect(stopShortcutCapture).not.toHaveBeenCalled();
+    shortcutCaptureHandler!({ key: "left_windows", isPressed: false });
+    await vi.waitFor(() => expect(stopShortcutCapture).toHaveBeenCalledOnce());
+    const saved = vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0] as ButtonMappings;
+    expect(saved.actions.power?.single).toEqual({
+      type: "shortcut",
+      chord: { keys: ["left_windows", "l"] },
+    });
+  });
+
+  it("warns when pre-held keys block the capture", async () => {
+    vi.mocked(startShortcutCapture).mockResolvedValueOnce(["left_control"]);
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const captureButton = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((button) => button.text().includes("录入自定义快捷键"))!;
+    await captureButton.trigger("click");
+    await vi.waitFor(() => expect(startShortcutCapture).toHaveBeenCalledOnce());
+    await vi.waitFor(() =>
+      expect(wrapper.text()).toContain("检测到仍有按住的按键，请先松开所有按键"),
+    );
+
+    shortcutCaptureHandler!({ key: "l", isPressed: true });
+    shortcutCaptureHandler!({ key: "l", isPressed: false });
+    await vi.waitFor(() =>
+      expect(wrapper.text()).not.toContain("检测到仍有按住的按键"),
+    );
+    wrapper.unmount();
+  });
+
+  it("records Win+L safely after the user enables fallback mode", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const safeToggle = wrapper.find(".safe-capture-toggle input");
+    const shortcutRow = wrapper.find(".custom-shortcut-row");
+    const toggleRow = wrapper.find(".safe-capture-toggle");
+    expect(shortcutRow.element.nextElementSibling).toBe(toggleRow.element);
+    expect(safeToggle.classes()).toContain("toggle-input");
+    expect(safeToggle.element.nextElementSibling?.textContent).toContain(
+      "直接录入无法完成或会触发系统动作时再开启",
+    );
+    expect((safeToggle.element as HTMLInputElement).checked).toBe(false);
+    await safeToggle.setValue(true);
+    const captureButton = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((button) => button.text().includes("录入自定义快捷键"))!;
+    await captureButton.trigger("click");
+    await vi.waitFor(() => expect(startShortcutCapture).toHaveBeenCalledOnce());
+
+    const leftWin = wrapper
+      .findAll(".capture-modifiers .chip")
+      .find((button) => button.text() === "左 Win")!;
+    await leftWin.trigger("click");
+    shortcutCaptureHandler!({ key: "l", isPressed: true });
+    await vi.waitFor(() => {
+      const calls = vi.mocked(saveButtonMappings).mock.calls;
+      const saved = calls.at(-1)?.[0] as ButtonMappings | undefined;
+      const action = saved?.actions.power?.single;
+      if (action?.type !== "shortcut" || action.chord.keys.join("+") !== "left_windows+l") {
+        throw new Error("Win+L 未保存");
+      }
+    });
+    await vi.waitFor(() =>
+      expect(wrapper.text()).toContain("已录入 Win + L，松开全部按键后完成"),
+    );
+    shortcutCaptureHandler!({ key: "l", isPressed: false });
+    await vi.waitFor(() => expect(stopShortcutCapture).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(wrapper.text()).toContain("快捷键已录入：Win + L"));
+  });
+
+  it("records Ctrl+[ from the native capture edge", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const captureButton = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((button) => button.text().includes("录入自定义快捷键"))!;
+    await captureButton.trigger("click");
+
+    shortcutCaptureHandler!({ key: "left_control", isPressed: true });
+    shortcutCaptureHandler!({ key: "oem4", isPressed: true });
+    shortcutCaptureHandler!({ key: "oem4", isPressed: false });
+    shortcutCaptureHandler!({ key: "left_control", isPressed: false });
+    await vi.waitFor(() => expect(stopShortcutCapture).toHaveBeenCalledOnce());
+    const saved = vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0] as ButtonMappings;
+    expect(saved.actions.power?.single).toEqual({
+      type: "shortcut",
+      chord: { keys: ["left_control", "oem4"] },
+    });
+    expect(wrapper.text()).toContain("已录入 左 Ctrl + [，松开全部按键后完成");
+    await vi.waitFor(() =>
+      expect(wrapper.text()).toContain("快捷键已录入：左 Ctrl + ["),
+    );
+  });
+
+  it("records Ctrl+] from the native capture edge", async () => {
+    const wrapper = await mountPage();
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    const captureButton = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((button) => button.text().includes("录入自定义快捷键"))!;
+    await captureButton.trigger("click");
+
+    shortcutCaptureHandler!({ key: "left_control", isPressed: true });
+    shortcutCaptureHandler!({ key: "oem6", isPressed: true });
+    shortcutCaptureHandler!({ key: "oem6", isPressed: false });
+    shortcutCaptureHandler!({ key: "left_control", isPressed: false });
+    await vi.waitFor(() => expect(stopShortcutCapture).toHaveBeenCalledOnce());
+    const saved = vi.mocked(saveButtonMappings).mock.calls.at(-1)?.[0] as ButtonMappings;
+    expect(saved.actions.power?.single).toEqual({
+      type: "shortcut",
+      chord: { keys: ["left_control", "oem6"] },
+    });
+    expect(wrapper.text()).toContain("已录入 左 Ctrl + ]，松开全部按键后完成");
+  });
+
+  it("highlights the card for a pressed physical button and clears it on release", async () => {
+    const wrapper = await mountPage();
+    const upCard = () =>
+      wrapper.findAll(".mapping-card").find((card) => card.text().includes("上"));
+    expect(upCard()!.classes()).not.toContain("active");
+
+    edgeHandler!({ button: "up", isPressed: true });
+    await vi.waitFor(() => {
+      if (!upCard()!.classes().includes("active")) throw new Error("未高亮");
+    });
+    edgeHandler!({ button: "up", isPressed: false });
+    await vi.waitFor(() => {
+      if (upCard()!.classes().includes("active")) throw new Error("未解除高亮");
+    });
+  });
+
+  it("keeps the selection locked while pressing the remote unless unlocked", async () => {
+    const wrapper = await mountPage();
+    // 默认锁定：按下"返回"不改变当前选中（未选中任何键时仍为空）。
+    edgeHandler!({ button: "back", isPressed: true });
+    const backCard = () =>
+      wrapper.findAll(".mapping-card").find((card) => card.text().includes("返回"));
+    await vi.waitFor(() => {
+      if (!backCard()!.classes().includes("active")) throw new Error("未高亮");
+    });
+    expect(backCard()!.classes()).not.toContain("selected");
+
+    // 解锁后：按下即选中该键的编辑。
+    const toggles = wrapper.findAll(".toggle-row");
+    const lockToggle = toggles.find((row) => row.text().includes("锁定当前按键"));
+    const input = lockToggle!.find("input");
+    await input.setValue(false);
+    edgeHandler!({ button: "back", isPressed: true });
+    await vi.waitFor(() => {
+      if (!backCard()!.classes().includes("selected")) throw new Error("未跟随选中");
+    });
+  });
+
+  /** 页脚的「锁定当前按键」开关（每次重新查找元素：Vue 重渲染后旧引用会失效）。 */
+  function lockToggleInput(wrapper: VueWrapper) {
+    const row = wrapper
+      .findAll(".toggle-row")
+      .find((candidate) => candidate.text().includes("锁定当前按键"));
+    if (!row) throw new Error("未找到锁定当前按键开关");
+    return row.find("input");
+  }
+
+  /** 页头开关行（按行内文字定位，供"就绪前占位符"用例共用）。 */
+  function toggleRowByText(wrapper: VueWrapper, text: string) {
+    const row = wrapper
+      .findAll(".toggle-row")
+      .find((candidate) => candidate.text().includes(text));
+    if (!row) throw new Error(`未找到开关行：${text}`);
+    return row;
+  }
+
+  it("uses the cached switch values on the very first frame", async () => {
+    // 2026-10-28：值来自 IPC，首帧拿不到，只能先占位再跳出来。缓存让开关第一帧
+    // 就是上次的状态；这里两个 IPC 永不返回，页面仍应显示缓存里的"关闭"。
+    localStorage.setItem(
+      "sayall.buttons.switches.v1",
+      JSON.stringify({ enabled: false, lockSelection: false }),
+    );
+    vi.mocked(getButtonMappings).mockImplementationOnce(() => new Promise<ButtonMappings>(() => {}));
+    vi.mocked(getLockMappingSelection).mockImplementationOnce(() => new Promise<boolean>(() => {}));
+
+    const wrapper = mount(ButtonsPage, { props: { runtime } });
+    mountedPages.push(wrapper);
+    await flushPromises();
+
+    const master = toggleRowByText(wrapper, "启用自定义按键功能").find("input");
+    const lock = toggleRowByText(wrapper, "锁定当前按键").find("input");
+    expect((master.element as HTMLInputElement).checked).toBe(false);
+    expect((lock.element as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("renders the mapping master switch immediately but keeps it disabled until the value is final", async () => {
+    // 2026-10-28：旧实现"就绪前用占位符顶位、就绪后创建本体"虽然没有滑入动画，
+    // 但用户看到的是"先空白、再跳出来"（反馈原话）。现在改成：开关始终渲染
+    // （初值取上次已知值），数据未到时先 **disabled** —— 既不会空白，也不会让用户
+    // 用默认值误触发一次保存把真实设置覆盖掉。就绪后按持久化值生效。
+    let releaseMappings: (value: ButtonMappings) => void = () => {};
+    vi.mocked(getButtonMappings).mockImplementationOnce(
+      () => new Promise<ButtonMappings>((resolve) => { releaseMappings = resolve; }),
+    );
+    const wrapper = mount(ButtonsPage, { props: { runtime } });
+    mountedPages.push(wrapper);
+    await flushPromises();
+
+    const row = () => toggleRowByText(wrapper, "启用自定义按键功能");
+    const pending = row().find("input");
+    expect(pending.exists()).toBe(true);
+    expect((pending.element as HTMLInputElement).disabled).toBe(true);
+
+    releaseMappings({ enabled: false, actions: {} });
+    await flushPromises();
+    await vi.waitFor(() => {
+      const input = row().find("input");
+      if (!input.exists()) throw new Error("就绪后开关不存在");
+      if ((input.element as HTMLInputElement).disabled) throw new Error("就绪后开关仍被禁用");
+      if ((input.element as HTMLInputElement).checked) {
+        throw new Error("开关没有采用持久化的真值（应为关）");
+      }
+    });
+  });
+
+  it("底部状态提示显示 8 秒后自动关闭", async () => {
+    const wrapper = await mountPage();
+    const bottom = wrapper.find(".mapping-bottom");
+    expect(bottom.find(".mapping-footer").exists()).toBe(true);
+    const master = toggleRowByText(wrapper, "启用自定义按键功能").find("input");
+    vi.useFakeTimers();
+    await master.setValue(false);
+    await flushPromises();
+    expect(bottom.find(".mapping-status").text()).toContain("总开关已更新");
+
+    vi.advanceTimersByTime(7_999);
+    await flushPromises();
+    expect(bottom.find(".mapping-status").exists()).toBe(true);
+
+    vi.advanceTimersByTime(1);
+    await flushPromises();
+    expect(bottom.find(".mapping-status").exists()).toBe(false);
+    expect(bottom.find(".mapping-footer").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("renders the lock switch immediately but keeps it disabled until the persisted value is loaded", async () => {
+    let releaseLock: (value: boolean) => void = () => {};
+    vi.mocked(getLockMappingSelection).mockImplementationOnce(
+      () => new Promise<boolean>((resolve) => { releaseLock = resolve; }),
+    );
+    const wrapper = mount(ButtonsPage, { props: { runtime } });
+    mountedPages.push(wrapper);
+    await flushPromises();
+
+    const row = () => toggleRowByText(wrapper, "锁定当前按键");
+    const pending = row().find("input");
+    expect(pending.exists()).toBe(true);
+    expect((pending.element as HTMLInputElement).disabled).toBe(true);
+
+    releaseLock(false);
+    await flushPromises();
+    await vi.waitFor(() => {
+      const input = row().find("input");
+      if (!input.exists()) throw new Error("就绪后开关不存在");
+      if ((input.element as HTMLInputElement).disabled) throw new Error("就绪后开关仍被禁用");
+      if ((input.element as HTMLInputElement).checked) {
+        throw new Error("开关没有采用持久化的真值（应为关）");
+      }
+    });
+  });
+
+  it("applies the persisted lock selection when the page mounts", async () => {
+    // 关过开关的用户再打开按键页：必须读回「关闭」，而不是回落默认「开启」。
+    vi.mocked(getLockMappingSelection).mockResolvedValue(false);
+    const wrapper = await mountPage();
+    await vi.waitFor(() => {
+      if ((lockToggleInput(wrapper).element as HTMLInputElement).checked) {
+        throw new Error("未应用持久化的关闭状态");
+      }
+    });
+
+    // 关闭状态下：按下遥控器键即选中该键（锁定语义随持久化值生效）。
+    edgeHandler!({ button: "back", isPressed: true });
+    const backCard = wrapper.findAll(".mapping-card").find((card) => card.text().includes("返回"))!;
+    await vi.waitFor(() => {
+      if (!backCard.classes().includes("selected")) throw new Error("未跟随选中");
+    });
+  });
+
+  it("persists the lock toggle so it stays off across page switches", async () => {
+    // 内存值模拟设置文件：get 返回已落盘值，save 写入并返回。
+    let persisted = true;
+    vi.mocked(getLockMappingSelection).mockImplementation(async () => persisted);
+    vi.mocked(saveLockMappingSelection).mockImplementation(async (locked: boolean) => {
+      persisted = locked;
+      return locked;
+    });
+
+    const first = await mountPage();
+    await lockToggleInput(first).setValue(false);
+    await vi.waitFor(() => {
+      if (!vi.mocked(saveLockMappingSelection).mock.calls.some(([value]) => value === false)) {
+        throw new Error("关闭动作未落盘");
+      }
+    });
+    first.unmount();
+
+    // 切到其他页再回来 = 重新挂载组件（本 Bug 的原始复现路径），开关必须保持关闭。
+    const second = await mountPage();
+    await vi.waitFor(() => {
+      if ((lockToggleInput(second).element as HTMLInputElement).checked) {
+        throw new Error("切页回来后又被打开了");
+      }
+    });
+  });
+
+  it("reverts the lock toggle and reports when saving fails", async () => {
+    const wrapper = await mountPage();
+    vi.mocked(saveLockMappingSelection).mockRejectedValueOnce(
+      new Error("保存锁定当前按键设置失败，请稍后重试"),
+    );
+    await lockToggleInput(wrapper).setValue(false);
+    await vi.waitFor(() => {
+      if (!(lockToggleInput(wrapper).element as HTMLInputElement).checked) {
+        throw new Error("保存失败后未回退到原状态");
+      }
+    });
+    await vi.waitFor(() => {
+      if (!wrapper.text().includes("保存锁定当前按键设置失败")) throw new Error("未显示失败提示");
+    });
+  });
+
+  it("falls back to locked and reports when the preference read fails", async () => {
+    vi.mocked(getLockMappingSelection).mockRejectedValueOnce(new Error("ipc down"));
+    const wrapper = await mountPage();
+    await vi.waitFor(() => {
+      if (!(lockToggleInput(wrapper).element as HTMLInputElement).checked) {
+        throw new Error("读取失败应回落默认（开启）");
+      }
+    });
+    await vi.waitFor(() => {
+      const reported = reportFrontendEventSpy.mock.calls
+        .map(([event]) => event as Record<string, unknown>)
+        .find((event) => event.event === "mapping_selection_lock");
+      if (!reported) throw new Error("读取失败未落结构化日志");
+      expect(reported).toMatchObject({
+        event: "mapping_selection_lock",
+        phase: "completed",
+        result: "failed",
+        reason: "load_failed",
+      });
+    });
+  });
+
+  it("logs the button-edge highlight timing for the highlight-latency ground truth", async () => {
+    await mountPage();
+    reportFrontendEventSpy.mockClear();
+
+    // 按下沿：必须落一条 button_edge（含"收到边沿 → 下一帧"的 elapsedMs），
+    // 否则现场只能看到引擎侧 map_edges、看不到高亮有没有出画面。
+    edgeHandler!({ button: "up", isPressed: true });
+    await vi.waitFor(() => {
+      const reported = reportFrontendEventSpy.mock.calls
+        .map(([event]) => event as Record<string, unknown>)
+        .find((event) => event.event === "button_edge");
+      if (!reported) throw new Error("按下边沿未落结构化日志");
+      expect(reported).toMatchObject({
+        event: "button_edge",
+        phase: "completed",
+        result: "passed",
+        reason: "pressed",
+        detail: "up",
+      });
+      expect(typeof reported.elapsedMs).toBe("number");
+    });
+
+    // 松开沿同样要落一条——"高亮迟迟不灭"这类现场只能靠它区分。
+    edgeHandler!({ button: "up", isPressed: false });
+    await vi.waitFor(() => {
+      const reasons = reportFrontendEventSpy.mock.calls
+        .map(([event]) => event as Record<string, unknown>)
+        .filter((event) => event.event === "button_edge")
+        .map((event) => event.reason);
+      if (!reasons.includes("released")) throw new Error("松开边沿未落结构化日志");
+    });
+  });
+
+  it("shows the fired gesture feedback from engine events", async () => {
+    const wrapper = await mountPage();
+    gestureHandler!({ button: "ok", trigger: "single" });
+    await vi.waitFor(() => {
+      // 手势反馈 = 对应格子出现闪烁态（flashed），600ms 后自动消失。
+      if (!wrapper.find(".mapping-cell.flashed").exists()) {
+        throw new Error("手势触发后格子未出现闪烁反馈");
+      }
+    });
+  });
+
+  it("ends the fired-gesture flash with the release edge, not a fixed 600ms tail", async () => {
+    const wrapper = await mountPage();
+    const flashed = () => wrapper.find(".mapping-cell.flashed").exists();
+
+    // 按下 + 动作触发（映射已配）：闪烁反馈出现。
+    edgeHandler!({ button: "ok", isPressed: true });
+    gestureHandler!({ button: "ok", trigger: "single" });
+    await vi.waitFor(() => {
+      if (!flashed()) throw new Error("未出现闪烁反馈");
+    });
+
+    // 松开：闪烁反馈必须跟着灭（现场反馈"配了映射就不能同灭"——原来固定 600ms）。
+    // 允许一段最短可见时间（150ms），但必须显著早于 600ms 兜底。
+    const releasedAt = performance.now();
+    edgeHandler!({ button: "ok", isPressed: false });
+    expect(flashed(), "最短可见时间内不应同帧消失").toBe(true);
+    await vi.waitFor(() => {
+      if (flashed()) throw new Error("松开后闪烁反馈仍在");
+    });
+    expect(performance.now() - releasedAt).toBeLessThan(400);
+  });
+
+  /** 编辑器内按标签找 chip 并返回其禁用态。 */
+  async function chipState(wrapper: VueWrapper, label: string): Promise<boolean> {
+    if (label === "添加应用" && !wrapper.find(".custom-app-group").exists()) {
+      await wrapper
+        .findAll(".mapping-editor button")
+        .find((button) => button.text() === "打开自定义 APP")!
+        .trigger("click");
+      await flushPromises();
+    }
+    const chip = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((element) => element.text().includes(label));
+    expect(chip, `未找到 chip：${label}`).toBeDefined();
+    return (chip!.element as HTMLButtonElement).disabled;
+  }
+
+  async function openCell(
+    wrapper: VueWrapper,
+    cardLabel: string,
+    triggerIndex: number,
+  ): Promise<void> {
+    const card = wrapper.findAll(".mapping-card").find((c) => c.text().includes(cardLabel));
+    expect(card, `未找到卡片：${cardLabel}`).toBeDefined();
+    await card!.findAll(".mapping-cell")[triggerIndex]!.trigger("click");
+    expect(wrapper.find(".mapping-editor").exists()).toBe(true);
+  }
+
+  it("全开放：确定·单击所有操作可配（注入链路已真机验证）+ 单响应提示", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "确定", 0);
+    expect(await chipState(wrapper, "Enter")).toBe(false);
+    expect(await chipState(wrapper, "Home")).toBe(false);
+    expect(await chipState(wrapper, "空格")).toBe(false);
+    expect(await chipState(wrapper, "Ctrl + V")).toBe(false);
+    expect(await chipState(wrapper, "录入自定义快捷键")).toBe(false);
+    expect(await chipState(wrapper, "添加应用")).toBe(false);
+    // 武装族按键显示冷首按副作用提示（信息性，不门控）。
+    expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
+  });
+
+  it("预设芯片显示实际按键组合，功能描述退为悬停提示", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "电源", 0);
+    const chips = wrapper.findAll(".mapping-editor .chip");
+    const texts = chips.map((chip) => chip.text());
+
+    expect(texts).toContain("Ctrl + C");
+    expect(texts).toContain("Alt + Tab");
+    expect(texts).toContain("Alt + F4");
+    expect(texts).toContain("Backspace");
+    expect(texts).toContain("Win + Shift + S");
+    expect(texts).not.toContain("复制");
+    expect(texts).not.toContain("退格");
+    expect(texts).not.toContain("截图");
+    expect(chips.find((chip) => chip.text() === "Ctrl + C")!.attributes("title")).toBe("复制");
+    expect(chips.find((chip) => chip.text() === "Alt + Tab")!.attributes("title")).toBe(
+      "切换应用：用左、右键选择，按“确定”确认，返回取消",
+    );
+    expect(chips.find((chip) => chip.text() === "Alt + F4")!.attributes("title")).toBe(
+      "关闭当前窗口",
+    );
+  });
+
+  it("方向键箭头用加粗描边，普通文字不受影响", async () => {
+    vi.mocked(getButtonMappings).mockResolvedValueOnce({
+      enabled: true,
+      actions: {
+        up: {
+          single: { type: "shortcut", chord: { keys: ["up"] } },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+        ok: {
+          single: { type: "shortcut", chord: { keys: ["enter"] } },
+          double: { type: "disabled" },
+          long: { type: "disabled" },
+        },
+      },
+    });
+    const wrapper = await mountPage();
+    const card = (label: string) =>
+      wrapper.findAll(".mapping-card").find((item) => item.text().includes(label))!;
+    const upSummary = card("上").findAll(".mapping-cell")[0]!.find("span");
+    expect(upSummary.text()).toBe("↑");
+    expect(upSummary.classes()).toContain("direction-arrow");
+
+    const enterSummary = card("确定").findAll(".mapping-cell")[0]!.find("span");
+    expect(enterSummary.text()).toBe("Enter");
+    expect(enterSummary.classes()).not.toContain("direction-arrow");
+  });
+
+  it("音量±与 OK 图标与键位方案页一致", async () => {
+    const wrapper = await mountPage();
+    const iconPaths = (label: string) =>
+      wrapper
+        .findAll(".mapping-card")
+        .find((card) => card.find(".mapping-card-title strong").text() === label)!
+        .findAll(".mapping-icon path")
+        .map((path) => path.attributes("d"));
+
+    expect(iconPaths("音量+")).toEqual([
+      "M4 9.5h3.2L12 6v12l-4.8-3.5H4z",
+      "M15 9a4.2 4.2 0 0 1 0 6",
+      "M17.6 6.4a8 8 0 0 1 0 11.2",
+    ]);
+    expect(iconPaths("音量−")).toEqual([
+      "M4 9.5h3.2L12 6v12l-4.8-3.5H4z",
+      "M15 9a4.2 4.2 0 0 1 0 6",
+    ]);
+    expect(iconPaths("确定")).toEqual([
+      "M12 3.2a8.8 8.8 0 1 0 0 17.6 8.8 8.8 0 0 0 0-17.6z",
+      "M8.2 12.3l2.4 2.4 5.2-5.4",
+    ]);
+  });
+
+  it("选中 Win 组合后摘要与卡片显示 Win，而不是左 Win", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "电源", 0);
+    const chip = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((element) => element.text() === "Win + D");
+    expect(chip).toBeDefined();
+    await chip!.trigger("click");
+    await vi.waitFor(() => expect(saveButtonMappings).toHaveBeenCalled());
+    await flushPromises();
+
+    const editorText = wrapper.find(".mapping-editor").text();
+    expect(editorText).toContain("当前：Win + D");
+    expect(editorText).not.toContain("左 Win");
+
+    const powerCard = wrapper
+      .findAll(".mapping-card")
+      .find((card) => card.text().includes("电源"))!;
+    expect(powerCard.text()).toContain("Win + D");
+    expect(powerCard.text()).not.toContain("左 Win");
+  });
+
+  it("切换应用芯片写入 app_switcher 会话动作而不是一次性快捷键", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "电源", 0);
+    const chip = wrapper
+      .findAll(".mapping-editor .chip")
+      .find((element) => element.text() === "Alt + Tab");
+    expect(chip).toBeDefined();
+    await chip!.trigger("click");
+    await vi.waitFor(() => expect(saveButtonMappings).toHaveBeenCalled());
+    const saved = vi.mocked(saveButtonMappings).mock.lastCall![0] as {
+      actions: Record<string, { single: unknown }>;
+    };
+    expect(saved.actions.power!.single).toEqual({ type: "app_switcher" });
+    const summary = wrapper.find(".mapping-editor .card-title-row p").text();
+    expect(summary).toContain("Alt + Tab");
+    expect(summary).not.toContain("切换应用");
+  });
+
+  it("全开放：确定·双击与 TV 所有操作可配 + 各自的单响应提示", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "确定", 1);
+    expect(await chipState(wrapper, "Enter")).toBe(false);
+    expect(await chipState(wrapper, "录入自定义快捷键")).toBe(false);
+    expect(await chipState(wrapper, "添加应用")).toBe(false);
+    expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
+
+    await openCell(wrapper, "TV", 0);
+    expect(await chipState(wrapper, "Enter")).toBe(false);
+    expect(await chipState(wrapper, "静音")).toBe(false);
+    expect(await chipState(wrapper, "录入自定义快捷键")).toBe(false);
+    expect(await chipState(wrapper, "添加应用")).toBe(false);
+    expect(wrapper.find(".mapping-editor").text()).toContain("这个键只执行你配置的动作");
+  });
+
+  it("左键与其余方向键同样开放自定义并显示结构性泄漏提示", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "左", 0);
+    expect(await chipState(wrapper, "←")).toBe(false);
+    expect(await chipState(wrapper, "Backspace")).toBe(false);
+    expect(await chipState(wrapper, "录入自定义快捷键")).toBe(false);
+    expect(wrapper.find(".mapping-editor").text()).toContain("它原本的按键效果");
+
+    // 与型号无关：RC001 上左键同样开放。
+    const rc001 = await mountPage("rc001");
+    const leftCellRc001 = rc001
+      .findAll(".mapping-card")
+      .find((c) => c.text().includes("左"))!
+      .findAll(".mapping-cell")[0]!;
+    expect((leftCellRc001.element as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("电源（直接归因族）全开放且无单响应提示", async () => {
+    const wrapper = await mountPage();
+    await openCell(wrapper, "电源", 2);
+    expect(await chipState(wrapper, "Esc")).toBe(false);
+    expect(await chipState(wrapper, "Win + Shift + S")).toBe(false);
+    expect(await chipState(wrapper, "录入自定义快捷键")).toBe(false);
+    expect(await chipState(wrapper, "添加应用")).toBe(false);
+    expect(wrapper.find(".mapping-editor").text()).not.toContain("原生按键动作");
+  });
+
+  it("全按键支持关闭时：返回/音量±置灰禁用并悬停指向开关（全型号一致）", async () => {
+    for (const model of ["rc003", "rc001", "unknown"] as const) {
+      const wrapper = await mountPage(model);
+      const backCard = wrapper
+        .findAll(".mapping-card")
+        .find((c) => c.find(".mapping-card-title strong").text() === "返回")!;
+      expect(backCard.classes(), `${model} 返回卡片应置灰`).toContain("is-locked");
+      expect(backCard.attributes("title"), `${model} 返回卡片悬停提示`).toBe(TRI_KEY_GATED_TITLE);
+      const backCell = backCard.findAll(".mapping-cell")[0]!;
+      expect((backCell.element as HTMLButtonElement).disabled, `${model} 返回格子应禁用`).toBe(true);
+      expect(backCell.attributes("title"), `${model} 返回格子悬停提示`).toBe(TRI_KEY_GATED_TITLE);
+      // 合成事件绕过原生 disabled：动作函数必须自守，不能打开编辑器。
+      await backCell.trigger("click");
+      expect(wrapper.find(".mapping-editor").exists(), `${model} 禁用格子不应打开编辑器`).toBe(false);
+
+      const volumeCard = wrapper
+        .findAll(".mapping-card")
+        .find((c) => c.find(".mapping-card-title strong").text().includes("音量"))!;
+      expect(volumeCard.classes(), `${model} 音量卡片应置灰`).toContain("is-locked");
+      expect(
+        (volumeCard.findAll(".mapping-cell")[0]!.element as HTMLButtonElement).disabled,
+        `${model} 音量格子应禁用`,
+      ).toBe(true);
+
+      // 其余按键不受影响：电源卡片照常可进编辑器。
+      const powerCard = wrapper
+        .findAll(".mapping-card")
+        .find((c) => c.find(".mapping-card-title strong").text() === "电源")!;
+      expect(powerCard.classes(), `${model} 电源卡片不应置灰`).not.toContain("is-locked");
+      await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+      expect(wrapper.find(".mapping-editor").exists(), `${model} 电源格子应可打开编辑器`).toBe(true);
+      wrapper.unmount();
+    }
+  });
+
+  it("开启全按键支持后：返回/音量±立即恢复正常（可点击、提示恢复按键信息）", async () => {
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    const wrapper = await mountPage("rc003");
+    const backCard = wrapper
+      .findAll(".mapping-card")
+      .find((c) => c.find(".mapping-card-title strong").text() === "返回")!;
+    expect(backCard.classes()).not.toContain("is-locked");
+    expect(backCard.attributes("title")).toBeUndefined();
+    const backCell = backCard.findAll(".mapping-cell")[0]!;
+    expect((backCell.element as HTMLButtonElement).disabled).toBe(false);
+    expect(backCell.attributes("title")).toContain("返回 · 单击");
+    await backCell.trigger("click");
+    expect(wrapper.find(".mapping-editor").exists()).toBe(true);
+  });
+
+  it("返回/音量±按型号如实标注源头捕获能力（不静默降级）", async () => {
+    // 关闭方向现场：开启态进入编辑器 → 现场关闭开关 → 三键说明切回关闭态整句。
+    // （关闭态下卡片已置灰禁用，这条路径是编辑器内关闭态说明的唯一入口。）
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    const rc003Closing = await mountPage("rc003");
+    const closingBackCard = rc003Closing
+      .findAll(".mapping-card")
+      .find((c) => c.text().includes("返回"))!;
+    await closingBackCard.findAll(".mapping-cell")[0]!.trigger("click");
+    await vi.waitFor(
+      () => {
+        expect(rc003Closing.find(".capability-note").text()).toContain("映射现在生效");
+      },
+      { timeout: 4000 },
+    );
+    const closingSwitch = captureRow(rc003Closing)!.find('input[type="checkbox"]');
+    (closingSwitch.element as HTMLInputElement).checked = false;
+    await closingSwitch.trigger("change");
+    await flushPromises();
+    await vi.waitFor(
+      () => {
+        // 2026-09-28 定稿：未开启时整句就是一句话（细节由确认弹窗承载）。
+        expect(rc003Closing.find(".capability-note").text()).toBe(TRI_KEY_HINT);
+      },
+      { timeout: 4000 },
+    );
+    // 关闭后卡片同步置灰禁用（开启后恢复正常）。
+    expect(
+      rc003Closing
+        .findAll(".mapping-card")
+        .find((c) => c.text().includes("返回"))!
+        .classes(),
+    ).toContain("is-locked");
+
+    // 已授权：如实说"现在生效"，且绝不回到旧占位文案。
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    const rc003On = await mountPage("rc003");
+    // 上一段把关闭态写进了首帧缓存，第二次挂载的首帧仍是关闭态；等首次对账把
+    // 开关切回开启态（三键卡片解锁）再操作——否则点击会被守卫拦下（同真实界面：
+    // 缓存只是首帧优化，权威状态落地前不可交互）。
+    await vi.waitFor(
+      () => {
+        expect(
+          rc003On
+            .findAll(".mapping-card")
+            .find((c) => c.find(".mapping-card-title strong").text() === "返回")!
+            .classes(),
+        ).not.toContain("is-locked");
+      },
+      { timeout: 4000 },
+    );
+    const rc003OnBack = rc003On
+      .findAll(".mapping-card")
+      .find((c) => c.text().includes("返回"))!
+      .findAll(".mapping-cell")[0]!;
+    await rc003OnBack.trigger("click");
+    await vi.waitFor(
+      () => {
+        expect(rc003On.find(".capability-note").text()).toContain("映射现在生效");
+      },
+      { timeout: 4000 },
+    );
+    expect(rc003On.find(".capability-note").text()).not.toContain(
+      "不进 Windows 输入栈",
+    );
+
+    // 2026-09-28 定稿：开启态下其他按键走「已优化」口径。
+    const rc003OnPower = rc003On
+      .findAll(".mapping-card")
+      .find((c) => c.text().includes("电源"))!
+      .findAll(".mapping-cell")[0]!;
+    await rc003OnPower.trigger("click");
+    await vi.waitFor(
+      () => {
+        expect(rc003On.find(".capability-note").text()).toBe(
+          "全按键支持已启用，此按键的映射已优化",
+        );
+      },
+      { timeout: 4000 },
+    );
+
+    // 型号不再区分（2026-09-24 产品决策）：RC001 上同一个开关状态驱动的
+    // 说明，RC001 专属文案（VK 0xFF）不回流。
+    const rc001 = await mountPage("rc001");
+    const rc001Volume = rc001
+      .findAll(".mapping-card")
+      .find((c) => c.text().includes("音量"))!
+      .findAll(".mapping-cell")[0]!;
+    await rc001Volume.trigger("click");
+    expect(rc001.find(".capability-note").text()).not.toContain("VK 0xFF");
+  });
+
+  it("全按键支持开关常驻页面头部，不依赖编辑面板（2026-09-27 挪至标题行）", async () => {
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    const page = await mountPage("rc003");
+    const home = page
+      .findAll(".mapping-card")
+      .find((card) => card.find(".mapping-card-title strong").text() === "主页")!;
+    await home.findAll(".mapping-cell")[0]!.trigger("click");
+    await vi.waitFor(() => {
+      expect(captureRow(page)).toBeDefined();
+    });
+    // 开启态「其他按键」（主页）走 2026-09-28 定稿的「已优化」口径；
+    // 本用例重点是 note 常驻头部、不依赖编辑面板展开路径。
+    await vi.waitFor(() => {
+      expect(page.find(".capability-note").text()).toBe(
+        "全按键支持已启用，此按键的映射已优化",
+      );
+    });
+  });
+
+  it("全按键支持开关使用与「启用自定义按键功能」一致的 Switch 样式（2026-09-28）", async () => {
+    const page = await mountPage("rc003");
+    const checkbox = captureRow(page)!.find('input[type="checkbox"]');
+    expect(checkbox.classes()).toContain("toggle-input");
+  });
+
+  it("开关与状态提示合并成一个开关（2026-10-10）：桥接相位不产生文字与圆点，也不再插入独立状态行", async () => {
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    const page = await mountPage("rc003");
+
+    // listening（启动中）：开关仍是开启态，页面上没有圆点、没有「正在启动」。
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(bridgeSnapshot("listening"));
+    await vi.waitFor(
+      () => {
+        const row = captureRow(page)!;
+        expect(row.find('input[type="checkbox"]').exists()).toBe(true);
+        expect((row.find('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(true);
+      },
+      { timeout: 3000 },
+    );
+    expect(captureRow(page)!.find(".status-dot").exists()).toBe(false);
+    expect(page.text()).not.toContain("正在启动");
+    expect(page.text()).not.toContain("全按键支持已开启");
+    expect(page.findAll(".device-chip").filter((chip) => chip.text().includes("全按键支持"))).toHaveLength(0);
+
+    // connected：同样没有圆点、没有任何状态文字。
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(bridgeSnapshot("connected"));
+    await page.vm.$nextTick();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(captureRow(page)!.find(".status-dot").exists()).toBe(false);
+    expect(page.find(".page-subtitle").text()).toBe("点击按键进行自定义配置");
+    expect(page.findAll(".device-chip").filter((chip) => chip.text().includes("全按键支持"))).toHaveLength(0);
+  });
+
+  it("关闭态不显示任何状态文案（圆点与状态字都已并入开关，2026-10-10）", async () => {
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    });
+    // 桥接快照故意给 connected：旧实现只要桥接有相位就画点——本用例是那条行为的阴性对照。
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(bridgeSnapshot("connected"));
+    const page = await mountPage("rc003");
+    await vi.waitFor(
+      () => {
+        expect(captureRow(page)!.find('input[type="checkbox"]').exists()).toBe(true);
+      },
+      { timeout: 3000 },
+    );
+    expect(captureRow(page)!.find(".status-dot").exists()).toBe(false);
+    expect(captureRow(page)!.find(".toggle-spinner").exists()).toBe(false);
+    expect(page.text()).not.toContain("未开启");
+    expect(page.find(".page-subtitle").text()).toBe("点击按键进行自定义配置");
+  });
+
+  it("「开着但没生效」给一句用户语言（2026-10-13）：只在后端说没生效时出现，生效后收回", async () => {
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    // inactive：过了宽限仍没有所有权（宿主重建、agent 消失就是这个形状）。
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(bridgeSnapshot("connected", "inactive"));
+    const page = await mountPage("rc003");
+    await vi.waitFor(
+      () => {
+        expect(page.find(".page-subtitle").text()).toContain("还没有生效");
+      },
+      { timeout: 3000 },
+    );
+    // 副标题那一位换成提示句（不插行），用告警色。
+    expect(page.find(".page-subtitle").text()).toBe(
+      "全按键支持还没有生效，正在自动重试；如果一直不恢复，请把开关关掉再打开。",
+    );
+    expect(page.find(".page-subtitle").classes()).toContain("is-failure");
+    // 提示句里不得出现内部术语，也不得把用户往遥控器侧引（现场已证伪）。
+    expect(page.find(".page-subtitle").text()).not.toContain("UAC");
+    expect(page.find(".page-subtitle").text()).not.toContain("遥控器");
+
+    // starting（助手正在连）与 active（真的生效）：都不显示，回到副标题。
+    for (const health of ["starting", "active"] as const) {
+      vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(
+        bridgeSnapshot("connected", health),
+      );
+      await vi.waitFor(
+        () => {
+          expect(page.find(".page-subtitle").text()).toBe("点击按键进行自定义配置");
+        },
+        { timeout: 3000 },
+      );
+      expect(page.find(".page-subtitle").classes()).not.toContain("is-failure");
+    }
+  });
+
+  it("启动对账把开关关掉时说明原因（2026-10-15，issue #264 附加观察甲）", async () => {
+    // 升级后最常见：旧任务的形态让对账把开关回落，用户看到的是"开关自己关了"。
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    });
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(
+      bridgeSnapshot("listening", "off", "task_power_policy_mismatch"),
+    );
+    const page = await mountPage("rc003");
+    await vi.waitFor(
+      () => {
+        expect(page.find(".page-subtitle").text()).toContain("重新打开一次");
+      },
+      { timeout: 3000 },
+    );
+    expect(page.find(".page-subtitle").text()).toBe(
+      "全按键支持因为系统授权需要重新确认，已经被关掉了；重新打开一次就能继续使用。",
+    );
+    expect(page.find(".page-subtitle").classes()).toContain("is-failure");
+    // 不摊机制：任务、UAC、架构这些词一个都不许出现。
+    for (const bad of ["UAC", "任务", "架构", "提权"]) {
+      expect(page.find(".page-subtitle").text()).not.toContain(bad);
+    }
+  });
+
+  it("开关已经开着时，陈旧的原因不再显示（重新开启即消解）", async () => {
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(
+      bridgeSnapshot("connected", "active", "task_missing"),
+    );
+    const page = await mountPage("rc003");
+    await vi.waitFor(
+      () => {
+        expect(page.find(".page-subtitle").text()).toBe("点击按键进行自定义配置");
+      },
+      { timeout: 3000 },
+    );
+    expect(page.find(".page-subtitle").classes()).not.toContain("is-failure");
+  });
+
+  it("状态未就绪时渲染同尺寸占位符、不渲染开关本体（与「启动行为」同法的无动画挂载，2026-09-28）", async () => {
+    // 对账失败 → rc003CaptureEnabled 保持 null → 只允许占位符顶位。
+    vi.mocked(getRc003TaskStatus).mockRejectedValue(new Error("ipc unavailable"));
+    const page = await mountPage("rc003");
+    const row = captureRow(page)!;
+    expect(row.find('input[type="checkbox"]').exists()).toBe(false);
+    expect(row.find(".toggle-placeholder").exists()).toBe(true);
+  });
+
+  it("缓存命中时进页首帧即渲染开关终值，不等 IPC（2026-09-28 Andy 要求：无延迟跳变）", () => {
+    localStorage.setItem(
+      "sayall.rc003Capture.uiCache",
+      JSON.stringify({ enabled: true, phase: "connected" }),
+    );
+    // 状态与桥接快照的 IPC 永不返回：旧行为里开关要等首次对账（串在映射
+    // 加载 + 三次订阅之后）——本用例证明开关在首帧就位，IPC 迟到不产生
+    // 可见的空档或状态跳变；状态提示已并入开关（2026-10-10），因此没有任何
+    // 状态文字或圆点需要等。
+    vi.mocked(getRc003TaskStatus).mockImplementation(() => new Promise(() => {}));
+    vi.mocked(getRc003BridgeSnapshot).mockImplementation(() => new Promise(() => {}));
+    const page = mount(ButtonsPage, { props: { runtime } });
+    const row = captureRow(page)!;
+    const checkbox = row.find('input[type="checkbox"]');
+    expect(checkbox.exists()).toBe(true);
+    expect((checkbox.element as HTMLInputElement).checked).toBe(true);
+    expect(row.find(".status-dot").exists()).toBe(false);
+    expect(row.find(".toggle-spinner").exists()).toBe(false);
+    page.unmount();
+  });
+
+  it("缓存与权威状态不一致时以对账结果为准并回写（卸载后重装回落关闭，2026-09-28）", async () => {
+    localStorage.setItem(
+      "sayall.rc003Capture.uiCache",
+      JSON.stringify({ enabled: true, phase: "connected" }),
+    );
+    // 卸载后重装：授权已撤销（authorizationRequired），持久化意图回落为关。
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: false,
+      authorizationRequired: true,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    });
+    const page = await mountPage("rc003");
+    await vi.waitFor(
+      () => {
+        const checkbox = captureRow(page)!.find('input[type="checkbox"]');
+        expect((checkbox.element as HTMLInputElement).checked).toBe(false);
+      },
+      { timeout: 3000 },
+    );
+    const cached = JSON.parse(localStorage.getItem("sayall.rc003Capture.uiCache") ?? "null") as {
+      enabled?: unknown;
+    };
+    expect(cached?.enabled).toBe(false);
+  });
+
+  it("状态与桥接快照就绪后写入缓存，供下次进页首帧渲染（2026-09-28）", async () => {
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(bridgeSnapshot("connected"));
+    const page = await mountPage("rc003");
+    await vi.waitFor(
+      () => {
+        const cached = JSON.parse(
+          localStorage.getItem("sayall.rc003Capture.uiCache") ?? "null",
+        ) as { enabled?: unknown; phase?: unknown } | null;
+        expect(cached).toMatchObject({ enabled: true, phase: "connected" });
+      },
+      { timeout: 3000 },
+    );
+    page.unmount();
+  });
+
+  it("缓存内容非法（垃圾/越界值）时忽略，回落占位符与旧行为（2026-09-28）", () => {
+    localStorage.setItem(
+      "sayall.rc003Capture.uiCache",
+      JSON.stringify({ enabled: "yes", phase: "hacked" }),
+    );
+    vi.mocked(getRc003TaskStatus).mockImplementation(() => new Promise(() => {}));
+    const page = mount(ButtonsPage, { props: { runtime } });
+    const row = captureRow(page)!;
+    expect(row.find('input[type="checkbox"]').exists()).toBe(false);
+    expect(row.find(".toggle-placeholder").exists()).toBe(true);
+    expect(row.find(".status-dot").exists()).toBe(false);
+    expect(row.find(".toggle-spinner").exists()).toBe(false);
+    page.unmount();
+  });
+
+  it("桥接段异步失败：开关下方一句用户语言（开关已开、无法走 toggle 失败分支，2026-10-10）", async () => {
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    const page = await mountPage("rc003");
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(bridgeSnapshot("failed"));
+    await vi.waitFor(
+      () => {
+        expect(page.find(".page-subtitle").text()).toContain("全按键支持没有启动成功");
+      },
+      { timeout: 3000 },
+    );
+    // 失败文案是唯一允许出现在开关旁的文字：圆点与「正在启动」都不再有。
+    expect(captureRow(page)!.find(".status-dot").exists()).toBe(false);
+    expect(page.text()).not.toContain("正在启动");
+    // 同一句里给出下一步，不带内部细节。
+    expect(page.find(".page-subtitle").text()).toContain("断开遥控器再重新配对");
+    // 桥接恢复后失败文案消失，回到副标题。
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(bridgeSnapshot("connected"));
+    await vi.waitFor(
+      () => {
+        expect(page.find(".page-subtitle").text()).toBe("点击按键进行自定义配置");
+      },
+      { timeout: 3000 },
+    );
+  });
+
+  it("UAC 被取消（enable 拒绝）时开关保持关闭、显示错误（2026-09-24 用户报告）", async () => {
+    // 复现链（升级/重装后）：任务删不掉但重授权标记在 → 开关回落关闭 →
+    // 用户打开 → 确认弹窗点「开启」→ UAC → 选「否」→ enable 拒绝。
+    // 此时开关绝不能翻成开启。
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: true,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    });
+    vi.mocked(enableRc003Capture).mockRejectedValue(
+      new Error("启用 RC003 三键捕获失败：授权未完成（UAC 被取消或安装失败）"),
+    );
+    const page = await mountPage("rc003");
+    const back = page
+      .findAll(".mapping-card")
+      .find((c) => c.text().includes("返回"))!
+      .findAll(".mapping-cell")[0]!;
+    await back.trigger("click");
+    // 页面有多个 toggle-row（总开关/全按键支持/锁定选择），必须按文本定位。
+    await vi.waitFor(() => {
+      expect(
+        page
+          .findAll(".toggle-row")
+          .filter((row) => row.text().includes("全按键支持")).length,
+      ).toBe(1);
+    });
+    const checkbox = page
+      .findAll(".toggle-row")
+      .filter((row) => row.text().includes("全按键支持"))[0]
+      .find('input[type="checkbox"]');
+    // 等初始化完成（rc003CaptureEnabled !== null 之前 checkbox 是 disabled，
+    // disabled 元素的 change 事件不会触发——这正是要测的行为的前提）。
+    await vi.waitFor(() => {
+      expect((checkbox.element as HTMLInputElement).disabled).toBe(false);
+    });
+    expect((checkbox.element as HTMLInputElement).checked).toBe(false);
+    // 忠实模拟浏览器：点击真实复选框时，**DOM 先被浏览器翻成勾选**，然后
+    // 才派发 change 事件。原来只 trigger("change") 永远复现不出
+    // 「状态是关、界面是开」——Vue 判定 :checked 前后都 false 而不打补丁。
+    (checkbox.element as HTMLInputElement).checked = true;
+    await checkbox.trigger("change");
+    // 每次开启都先弹确认：点「开启」后才会真正调用 enable。
+    const uacDialog = confirmDialog(page);
+    expect(uacDialog).toBeDefined();
+    await uacDialog!.findAll("button").find((b) => b.text() === "开启")!.trigger("click");
+    await vi.waitFor(() => {
+      // 失败文案只有一句用户语言：说清结果与下一步，不带内部原文（2026-10-10）。
+      expect(page.find(".page-subtitle").text()).toBe(
+        "没有完成系统授权，全按键支持保持关闭。",
+      );
+    });
+    expect(page.text()).not.toContain("UAC");
+    expect(page.text()).not.toContain("授权未完成");
+    // ……且开关仍是关闭：实际系统状态没变，开关翻过去就是"证据说谎"。
+    const captureRow = page
+      .findAll(".toggle-row")
+      .filter((row) => row.text().includes("全按键支持"))[0];
+    expect(
+      (captureRow.find('input[type="checkbox"]').element as HTMLInputElement)
+        .checked,
+    ).toBe(false);
+  });
+});
+
+describe("全按键支持开启前确认弹窗", () => {
+  async function openCaptureToggle(page: VueWrapper) {
+    const back = page
+      .findAll(".mapping-card")
+      .find((c) => c.text().includes("返回"))!
+      .findAll(".mapping-cell")[0]!;
+    await back.trigger("click");
+    await vi.waitFor(() => {
+      expect(
+        page
+          .findAll(".toggle-row")
+          .filter((row) => row.text().includes("全按键支持")).length,
+      ).toBe(1);
+    });
+    const checkbox = captureRow(page)!.find('input[type="checkbox"]');
+    // CI 双核慢机余量：授权状态已改为挂载后立即对账（微任务），正常瞬时可过；
+    // 4000ms 只防无关步骤偶发慢（与下方 capability-note 用例同一口径）。
+    await vi.waitFor(
+      () => {
+        expect((checkbox.element as HTMLInputElement).disabled).toBe(false);
+      },
+      { timeout: 4000 },
+    );
+    return checkbox;
+  }
+
+  function captureCheckboxChecked(page: VueWrapper): boolean {
+    // 每次重新取元素：Vue 重渲染可能替换 DOM 节点，早先拿到的引用会变成
+    // 已卸载节点，读到过期状态（实测约 1/3 概率让本用例假失败）。
+    return (captureRow(page)!.find('input[type="checkbox"]').element as HTMLInputElement)
+      .checked;
+  }
+
+  beforeEach(() => {
+    vi.mocked(enableRc003Capture).mockClear();
+    vi.mocked(disableRc003Capture).mockClear();
+  });
+
+  it("开关悬停提示随状态切换；弹窗文案不再出现内部视角表述", async () => {
+    const page = await mountPage("rc003");
+    await openCaptureToggle(page);
+
+    // 2026-09-28 定稿：关闭态指向「开启后支持使用…」。
+    expect(captureRow(page)!.attributes("title")).toBe(
+      CAPTURE_SWITCH_OFF_TITLE,
+    );
+
+    const checkbox = captureRow(page)!.find('input[type="checkbox"]');
+    (checkbox.element as HTMLInputElement).checked = true;
+    await checkbox.trigger("change");
+    await flushPromises();
+
+    // 默认 mock 是「未授权」场景：change 先弹确认弹窗，开关此时尚未
+    // 真正开启——title 保持关闭态文案是正确行为。
+    const dialog = confirmDialog(page);
+    expect(dialog).toBeDefined();
+    // 2026-09-27 用户要求去掉「Windows 平时看不见它们」。
+    expect(dialog!.text()).not.toContain("Windows 平时看不见它们");
+    // 2026-10-03 定稿：每次开启都重新弹窗 + 重新授权（每次都会弹 Windows
+    // 授权窗口），旧文案「升级/覆盖安装后无需重新授权」不再成立。
+    expect(dialog!.text()).toContain("每次开启都会弹出 Windows 授权窗口");
+    expect(dialog!.text()).not.toContain("无需重新授权");
+    // 2026-10-03 新增：杀毒软件风险（只提醒，不给处置建议）。
+    expect(dialog!.text()).toContain("杀毒软件");
+    expect(dialog!.text()).toContain("防作弊");
+
+    // 点弹窗「开启」完成授权 → 真正开启后悬停提示切到「关闭后…将不可映射」。
+    await dialog!
+      .findAll("button")
+      .find((b) => b.text() === "开启")!
+      .trigger("click");
+    await flushPromises();
+    await vi.waitFor(() => {
+      expect(captureRow(page)!.attributes("title")).toBe(
+        CAPTURE_SWITCH_ON_TITLE,
+      );
+    });
+  });
+
+  it("每次开启都先弹确认并重新授权：授权已在（authorizationRequired=false）也一样", async () => {
+    const page = await mountPage("rc003");
+    const checkbox = await openCaptureToggle(page);
+
+    // ── 场景 A：任务未注册（首次开启）→ 先弹确认 ──
+    // 浏览器先把 DOM 翻成勾选，再派发 change（与既有用例同一保真写法）。
+    (checkbox.element as HTMLInputElement).checked = true;
+    await checkbox.trigger("change");
+    await flushPromises();
+
+    const dialog = confirmDialog(page);
+    expect(dialog).toBeDefined();
+    expect(vi.mocked(enableRc003Capture)).not.toHaveBeenCalled();
+
+    // 取消：不开启，开关保持关闭。
+    await dialog!.findAll("button").find((b) => b.text() === "取消")!.trigger("click");
+    await flushPromises();
+    expect(confirmDialog(page)).toBeUndefined();
+    expect(vi.mocked(enableRc003Capture)).not.toHaveBeenCalled();
+    expect(captureCheckboxChecked(page)).toBe(false);
+
+    // 再次点开：仍先弹（还没授权）。
+    (checkbox.element as HTMLInputElement).checked = true;
+    await checkbox.trigger("change");
+    await flushPromises();
+    const second = confirmDialog(page);
+    expect(second).toBeDefined();
+
+    // 确认：真正开启。
+    await second!.findAll("button").find((b) => b.text() === "开启")!.trigger("click");
+    await flushPromises();
+    expect(vi.mocked(enableRc003Capture)).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(captureCheckboxChecked(page)).toBe(true);
+    });
+
+    // ── 场景 B：授权已在（任务在、无重授权标记）也照样先弹确认 ──
+    // 2026-10-03 Andy 定稿：每次开启都重新弹窗 + 重新授权（每次都会弹
+    // Windows 授权窗口），判据不再依赖 authorizationRequired。
+    // 轮询状态同步改为「授权已在、开关关着」，与真实系统一致；先改 mock
+    // 再操作，避免秒级轮询用旧状态覆盖 rc003Task 造成竞态。
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    });
+    const offSwitch = captureRow(page)!.find('input[type="checkbox"]');
+    (offSwitch.element as HTMLInputElement).checked = false;
+    await offSwitch.trigger("change");
+    await flushPromises();
+    const onSwitch = captureRow(page)!.find('input[type="checkbox"]');
+    (onSwitch.element as HTMLInputElement).checked = true;
+    await onSwitch.trigger("change");
+    await flushPromises();
+    const third = confirmDialog(page);
+    expect(third).toBeDefined();
+    expect(vi.mocked(enableRc003Capture)).toHaveBeenCalledTimes(1);
+    // 取消：仍不开启（确认框是每次开启的必经步骤）。
+    await third!.findAll("button").find((b) => b.text() === "取消")!.trigger("click");
+    await flushPromises();
+    expect(vi.mocked(enableRc003Capture)).toHaveBeenCalledTimes(1);
+    expect(captureCheckboxChecked(page)).toBe(false);
+
+    const reopened = captureRow(page)!.find('input[type="checkbox"]');
+    (reopened.element as HTMLInputElement).checked = true;
+    await reopened.trigger("change");
+    await flushPromises();
+    await confirmDialog(page)!
+      .findAll("button")
+      .find((b) => b.text() === "开启")!
+      .trigger("click");
+    await flushPromises();
+    expect(vi.mocked(enableRc003Capture)).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => {
+      expect(captureCheckboxChecked(page)).toBe(true);
+    });
+  });
+
+  it("升级/重装后（任务删不掉但重授权标记在）：仍先弹确认再开启", async () => {
+    // 这正是 2026-09-27 报告的缺陷场景：旧实现把「已读过」记在 localStorage，
+    // 重装后标记仍在 → 弹窗消失；新判据 authorizationRequired 由安装器标记
+    // 驱动，与「已读过」无关——重装后那次开启必然先弹。
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: true,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    });
+    const page = await mountPage("rc003");
+    const checkbox = await openCaptureToggle(page);
+    (checkbox.element as HTMLInputElement).checked = true;
+    await checkbox.trigger("change");
+    await flushPromises();
+
+    const dialog = confirmDialog(page);
+    expect(dialog).toBeDefined();
+    expect(vi.mocked(enableRc003Capture)).not.toHaveBeenCalled();
+
+    // 确认后开启（UAC 在这次 IPC 里发生）。
+    await dialog!.findAll("button").find((b) => b.text() === "开启")!.trigger("click");
+    await flushPromises();
+    expect(vi.mocked(enableRc003Capture)).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(captureCheckboxChecked(page)).toBe(true);
+    });
+  });
+
+  it("挂载后立即对账授权状态：不等 1 秒轮询首跳，开关即可用", async () => {
+    // PR #132 CI 实测：授权状态只在挂载 1 秒后的首次 interval 轮询里落地，
+    // CI 慢机上 openCaptureToggle 的 waitFor（默认 1000ms）被压线超时；
+    // 真机上则是「进页面头 1 秒开关点不动、无解释」。挂载后必须立即拉一次。
+    const page = await mountPage("rc003");
+    // 只清微任务队列、不推进真实时间：1 秒后的首次 interval 轮询不会跑。
+    // 若授权状态仍依赖轮询首跳，下面的断言必失败。
+    await flushPromises();
+    const back = page
+      .findAll(".mapping-card")
+      .find((c) => c.text().includes("返回"))!
+      .findAll(".mapping-cell")[0]!;
+    await back.trigger("click");
+    await flushPromises();
+    const row = page
+      .findAll(".toggle-row")
+      .filter((r) => r.text().includes("全按键支持"))[0]!;
+    expect(
+      (row.find('input[type="checkbox"]').element as HTMLInputElement).disabled,
+    ).toBe(false);
+  });
+
+});
+
+describe("按键页头部：副标题与遥控器信息卡片（2026-10-04）", () => {
+  // 2026-10-01 Andy 要求：头部显示遥控器型号（而不是蓝牙广播名）；
+  // 2026-10-04 起头部是从「设备胶囊」改成「遥控器信息卡片」（对标 Mac mappingPage）。
+  it.each([
+    ["rc001" as const, "小米蓝牙语音遥控器 2"],
+    ["rc003" as const, "小米蓝牙语音遥控器 2 Pro"],
+  ])("遥控器信息卡片显示遥控器型号（%s）", async (model, expected) => {
+    const page = await mountPage(model);
+    expect(page.find(".remote-info-card").text()).toContain(expected);
+    page.unmount();
+  });
+
+  it("型号未读回时遥控器信息卡片退回蓝牙广播名", async () => {
+    const page = await mountPage("unknown");
+    expect(page.find(".remote-info-card").text()).toContain("小米蓝牙语音遥控器");
+    expect(page.find(".remote-info-card").text()).not.toContain("连接后显示");
+    page.unmount();
+  });
+
+  // 2026-10-04 Andy 定稿：标题下加副标题，右上角改「遥控器信息卡片」（图标 + 型号 + 状态/电量 + 重新连接）。
+  it("标题下给出「点击按键进行自定义配置」引导", async () => {
+    const page = await mountPage();
+    expect(page.find(".page-subtitle").text()).toBe("点击按键进行自定义配置");
+    page.unmount();
+  });
+
+  it("信息卡片显示连接状态；电量已知时显示、未知时不占位", async () => {
+    const withBattery = {
+      ...runtime,
+      platform: {
+        ...runtime.platform,
+        connection: { ...runtime.platform.connection, batteryLevel: 92 },
+      },
+    };
+    const page = mount(ButtonsPage, { props: { runtime: withBattery } });
+    await flushPromises();
+    expect(page.find(".remote-info-card").text()).toContain("已连接");
+    expect(page.find(".remote-info-card").text()).toContain("92%");
+    // 2026-10-04 Andy：卡片左侧的遥控器图标不要（只留文字与按钮）。
+    expect(page.find(".remote-info-card .remote-glyph").exists()).toBe(false);
+    page.unmount();
+
+    const page2 = await mountPage();
+    expect(page2.find(".remote-info-card").text()).not.toContain("%");
+    page2.unmount();
+  });
+
+  it("已连接时按钮写「重新连接」，未连接时写「立即连接」", async () => {
+    const page = await mountPage();
+    expect(page.find(".remote-info-card button").text()).toBe("重新连接");
+    page.unmount();
+
+    const offline = {
+      ...runtime,
+      platform: {
+        ...runtime.platform,
+        connection: {
+          ...runtime.platform.connection,
+          phase: "idle" as const,
+          remoteModel: "unknown" as const,
+          remoteName: null,
+        },
+      },
+    };
+    const page2 = mount(ButtonsPage, { props: { runtime: offline } });
+    await flushPromises();
+    expect(page2.find(".remote-info-card button").text()).toBe("立即连接");
+    page2.unmount();
+  });
+
+  it("点「重新连接」：扫描已配对设备，按型号连回当前遥控器", async () => {
+    vi.mocked(scanPairedRemotes).mockResolvedValue([
+      { id: "rc001-id", name: "小米蓝牙语音遥控器", model: "rc001", isSupportedCandidate: true },
+      { id: "rc003-id", name: "客厅遥控器", model: "rc003", isSupportedCandidate: true },
+    ]);
+    const page = await mountPage("rc003");
+    await page.find(".remote-info-card button").trigger("click");
+    expect(vi.mocked(scanPairedRemotes)).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      if (vi.mocked(connectRemote).mock.calls.length === 0) throw new Error("尚未发起连接");
+    });
+    expect(vi.mocked(connectRemote)).toHaveBeenCalledWith("rc003-id");
+    page.unmount();
+  });
+
+  it("型号未知时按蓝牙广播名匹配已配对设备", async () => {
+    vi.mocked(scanPairedRemotes).mockResolvedValue([
+      { id: "other-id", name: "别的遥控器", model: "rc001", isSupportedCandidate: true },
+      { id: "named-id", name: "小米蓝牙语音遥控器", model: "unknown", isSupportedCandidate: true },
+    ]);
+    const page = await mountPage("unknown");
+    await page.find(".remote-info-card button").trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(connectRemote).mock.calls.length === 0) throw new Error("尚未发起连接");
+    });
+    expect(vi.mocked(connectRemote)).toHaveBeenCalledWith("named-id");
+    page.unmount();
+  });
+
+  it("匹配不到型号与名字时退回第一个候选设备", async () => {
+    vi.mocked(scanPairedRemotes).mockResolvedValue([
+      { id: "first-id", name: "遥控器 A", model: "rc001", isSupportedCandidate: true },
+      { id: "second-id", name: "遥控器 B", model: "unknown", isSupportedCandidate: true },
+    ]);
+    const page = await mountPage("rc003");
+    await page.find(".remote-info-card button").trigger("click");
+    await vi.waitFor(() => {
+      if (vi.mocked(connectRemote).mock.calls.length === 0) throw new Error("尚未发起连接");
+    });
+    expect(vi.mocked(connectRemote)).toHaveBeenCalledWith("first-id");
+    page.unmount();
+  });
+
+  it("连接期间按钮禁用并写「连接中…」，完成后恢复", async () => {
+    let release: (value: PairedRemote[]) => void = () => {};
+    vi.mocked(scanPairedRemotes).mockImplementation(
+      () =>
+        new Promise<PairedRemote[]>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const page = await mountPage();
+    await page.find(".remote-info-card button").trigger("click");
+    expect(page.find(".remote-info-card button").text()).toBe("连接中…");
+    expect((page.find(".remote-info-card button").element as HTMLButtonElement).disabled).toBe(true);
+    release([{ id: "rc003-id", name: "客厅遥控器", model: "rc003", isSupportedCandidate: true }]);
+    await flushPromises();
+    expect(page.find(".remote-info-card button").text()).toBe("重新连接");
+    expect((page.find(".remote-info-card button").element as HTMLButtonElement).disabled).toBe(false);
+    page.unmount();
+  });
+
+  it("扫描不到已配对遥控器时给出提示且不发起连接", async () => {
+    vi.mocked(scanPairedRemotes).mockResolvedValue([]);
+    const page = await mountPage();
+    await page.find(".remote-info-card button").trigger("click");
+    await flushPromises();
+    expect(vi.mocked(connectRemote)).not.toHaveBeenCalled();
+    expect(page.find(".mapping-status").text()).toContain("没有找到已配对的遥控器");
+    page.unmount();
+  });
+
+  it("扫描失败时把错误显示在页面提示里，按钮恢复可用", async () => {
+    vi.mocked(scanPairedRemotes).mockRejectedValue(new Error("扫描失败"));
+    const page = await mountPage();
+    await page.find(".remote-info-card button").trigger("click");
+    await vi.waitFor(() => {
+      if (!page.find(".mapping-status").text().includes("扫描失败")) throw new Error("提示尚未出现");
+    });
+    expect(vi.mocked(connectRemote)).not.toHaveBeenCalled();
+    expect((page.find(".remote-info-card button").element as HTMLButtonElement).disabled).toBe(false);
+    page.unmount();
+  });
+});
+
+/**
+ * 「全按键支持」在本机不可用（2026-10-07 issue #206，Windows 11 ARM64）。
+ *
+ * 现场形状：开关打开后界面永久停在「全按键支持已开启，正在启动」。因此本组
+ * 用例同时钉住两件事——置灰（开关 + 三键卡片）与「不再有永久等待文案」，
+ * 且可用平台上（available=true）行为一字不变。
+ */
+describe("全按键支持在本机不可用（issue #206）", () => {
+  /** 开关旁不可用说明（短说明）：位于标题行内、开关标签之后。 */
+  function unavailableNote(page: VueWrapper) {
+    return page.find(".capture-unavailable-note");
+  }
+
+  it("开关置灰并给出原因与恢复方式，页面不再出现「正在启动」", async () => {
+    // 故意给报障现场的形状（持久化意图仍为开启、桥接相位停在 listening）：
+    // 后端已把开启意图回落为关闭，界面也必须自己守住这一口径——否则后端未及
+    // 回落或缓存先落地时，又会渲染出「全按键支持已开启，正在启动」。
+    vi.mocked(getCaptureSupport).mockResolvedValue(UNSUPPORTED_CAPTURE);
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(bridgeSnapshot("listening"));
+    const page = await mountPage("rc003");
+    await flushPromises();
+
+    const row = captureRow(page)!;
+    const checkbox = row.find('input[type="checkbox"]');
+    expect((checkbox.element as HTMLInputElement).disabled, "不可用时开关必须置灰").toBe(true);
+    expect(row.attributes("title"), "开关悬停提示指向原因与恢复方式").toBe(
+      CAPTURE_UNSUPPORTED_TITLE,
+    );
+    // 状态点（含它的悬停文案）在不可用时不出现：没有任何「正在启动」。
+    expect(row.find(".status-dot").exists()).toBe(false);
+    expect(row.html()).not.toContain("正在启动");
+    expect(page.html()).not.toContain("全按键支持已开启");
+
+    // 合成事件会绕过原生 disabled：动作入口必须自守，不弹确认、不动 IPC。
+    await checkbox.trigger("change");
+    await flushPromises();
+    expect(confirmDialog(page)).toBeUndefined();
+    expect(vi.mocked(enableRc003Capture)).not.toHaveBeenCalled();
+    expect(vi.mocked(disableRc003Capture)).not.toHaveBeenCalled();
+
+    // 开关旁一句短说明（≤ 40 字）。
+    const note = unavailableNote(page);
+    expect(note.exists(), "不可用时必须就地说明").toBe(true);
+    expect(note.text()).toContain(CAPTURE_UNSUPPORTED_NOTE);
+    page.unmount();
+  });
+
+  it("三键卡片与格子置灰，悬停提示说清原因（不再写「开启后恢复正常」）", async () => {
+    vi.mocked(getCaptureSupport).mockResolvedValue(UNSUPPORTED_CAPTURE);
+    const page = await mountPage("rc003");
+    await flushPromises();
+
+    const backCard = page
+      .findAll(".mapping-card")
+      .find((card) => card.find(".mapping-card-title strong").text() === "返回")!;
+    expect(backCard.classes()).toContain("is-locked");
+    expect(backCard.attributes("title")).toBe(TRI_KEY_UNSUPPORTED_TITLE);
+    expect(backCard.attributes("title")).not.toContain("开启后恢复正常");
+    expect(backCard.attributes("title")).not.toContain("需要全按键支持才能使用");
+    const backCell = backCard.findAll(".mapping-cell")[0]!;
+    expect((backCell.element as HTMLButtonElement).disabled).toBe(true);
+    expect(backCell.attributes("title")).toBe(TRI_KEY_UNSUPPORTED_TITLE);
+    await backCell.trigger("click");
+    expect(page.find(".mapping-editor").exists()).toBe(false);
+
+    const volumeCard = page
+      .findAll(".mapping-card")
+      .find((card) => card.find(".mapping-card-title strong").text().includes("音量"))!;
+    expect(volumeCard.classes()).toContain("is-locked");
+    expect(volumeCard.attributes("title")).toBe(TRI_KEY_UNSUPPORTED_TITLE);
+
+    // 其余按键不受影响（短说明里的「其他按键不受影响」必须是真的）。
+    const powerCard = page
+      .findAll(".mapping-card")
+      .find((card) => card.find(".mapping-card-title strong").text() === "电源")!;
+    expect(powerCard.classes()).not.toContain("is-locked");
+    await powerCard.findAll(".mapping-cell")[0]!.trigger("click");
+    expect(page.find(".mapping-editor").exists()).toBe(true);
+    page.unmount();
+  });
+
+  it("available=true 时行为不变：开关可点、三键仍走「开启后恢复正常」口径", async () => {
+    vi.mocked(getCaptureSupport).mockResolvedValue(SUPPORTED_CAPTURE);
+    const page = await mountPage("rc003");
+    await flushPromises();
+
+    const row = captureRow(page)!;
+    expect((row.find('input[type="checkbox"]').element as HTMLInputElement).disabled).toBe(
+      false,
+    );
+    expect(row.attributes("title")).toBe(CAPTURE_SWITCH_OFF_TITLE);
+    expect(unavailableNote(page).exists()).toBe(false);
+
+    const backCard = page
+      .findAll(".mapping-card")
+      .find((card) => card.find(".mapping-card-title strong").text() === "返回")!;
+    expect(backCard.classes()).toContain("is-locked");
+    expect(backCard.attributes("title")).toBe(TRI_KEY_GATED_TITLE);
+    page.unmount();
+  });
+
+  it("available=true 且开关开启时也不出现任何状态提示（不误伤 x64 平台，2026-10-10）", async () => {
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: true,
+      helperPath: null,
+      lastError: null,
+    });
+    vi.mocked(getRc003BridgeSnapshot).mockResolvedValue(bridgeSnapshot("listening"));
+    const page = await mountPage("rc003");
+    await flushPromises();
+
+    const row = captureRow(page)!;
+    expect((row.find('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(true);
+    expect(row.find(".status-dot").exists()).toBe(false);
+    expect(row.find(".toggle-spinner").exists()).toBe(false);
+    expect(page.text()).not.toContain("正在启动");
+    expect(page.find(".page-subtitle").text()).toBe("点击按键进行自定义配置");
+    expect(unavailableNote(page).exists()).toBe(false);
+    page.unmount();
+  });
+
+  it("正在操作：开关置灰 + 转圈，且不配任何文字（2026-10-10）", async () => {
+    vi.mocked(getRc003TaskStatus).mockResolvedValue({
+      installed: true,
+      authorizationRequired: false,
+      enabled: false,
+      helperPath: null,
+      lastError: null,
+    });
+    // enable 挂起 = 操作进行中（真机上这一段是授权窗口期间）。
+    let release!: (value: Awaited<ReturnType<typeof enableRc003Capture>>) => void;
+    vi.mocked(enableRc003Capture).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const page = await mountPage("rc003");
+    await flushPromises();
+
+    const row = captureRow(page)!;
+    const checkbox = row.find('input[type="checkbox"]');
+    await vi.waitFor(() => {
+      expect((checkbox.element as HTMLInputElement).disabled).toBe(false);
+    });
+    (checkbox.element as HTMLInputElement).checked = true;
+    await checkbox.trigger("change");
+    const dialog = confirmDialog(page);
+    await dialog!.findAll("button").find((b) => b.text() === "开启")!.trigger("click");
+    await flushPromises();
+
+    expect((checkbox.element as HTMLInputElement).disabled, "进行中必须置灰").toBe(true);
+    expect(row.find(".toggle-spinner").exists()).toBe(true);
+    expect(page.text()).not.toContain("正在操作");
+    expect(page.text()).not.toContain("正在启动");
+
+    release({ installed: true, authorizationRequired: false, enabled: true, helperPath: null, lastError: null });
+    await vi.waitFor(() => {
+      expect(row.find(".toggle-spinner").exists()).toBe(false);
+    });
+    expect((checkbox.element as HTMLInputElement).checked).toBe(true);
+    expect(page.find(".page-subtitle").text()).toBe("点击按键进行自定义配置");
+    page.unmount();
+  });
+
+  it("支持情况读不到（IPC 失败）时不置灰：不因一次失败把功能锁死", async () => {
+    vi.mocked(getCaptureSupport).mockRejectedValue(new Error("ipc unavailable"));
+    const page = await mountPage("rc003");
+    await flushPromises();
+
+    const row = captureRow(page)!;
+    expect((row.find('input[type="checkbox"]').element as HTMLInputElement).disabled).toBe(
+      false,
+    );
+    expect(unavailableNote(page).exists()).toBe(false);
+    page.unmount();
+  });
+});

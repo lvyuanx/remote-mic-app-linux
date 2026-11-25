@@ -1,0 +1,4 @@
+# Active-session access to the supported Xiaomi Bluetooth remote only.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{id/bustype}=="0005", ATTRS{id/vendor}=="2717", ATTRS{id/product}=="32b8", TAG+="uaccess"
+# Virtual keyboard/mouse output used by SayAll under X11 and Wayland.
+SUBSYSTEM=="misc", KERNEL=="uinput", TAG+="uaccess"
