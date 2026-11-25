@@ -12,6 +12,7 @@ import {
 import { reportFrontendEvent, reasonToken } from "../lib/frontend-diagnostics";
 import { t, tPage } from "../lib/i18n";
 import { effectiveLanguage } from "../lib/language-state";
+import { isLinuxRuntime } from "../lib/linux";
 import { COMBINATION_ACTIONS_ENABLED } from "../lib/feature-flags";
 import {
   CAPTURE_MODIFIER_SOURCES,
@@ -2577,6 +2578,9 @@ onUnmounted(() => {
              原「设备操作 / 聚焦输入框」并入本组的录制按钮右侧。 -->
         <section class="action-section">
           <h4 class="action-section-title">{{ t("自定义动作") }}</h4>
+          <p v-if="isLinuxRuntime()" class="muted editor-note">
+            {{ t("请在当前窗口录入；Super、Alt+Tab 等桌面快捷键请开启安全录入模式，用鼠标选择修饰键，再按主键。") }}
+          </p>
           <div class="custom-shortcut-row">
             <button
               class="chip"

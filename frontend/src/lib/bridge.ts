@@ -1912,7 +1912,7 @@ export async function stopShortcutCapture(): Promise<ShortcutCaptureStopResult |
 export async function subscribeShortcutCaptureEdges(
   handler: (edge: ShortcutCaptureEdge) => void,
 ): Promise<() => void> {
-  if (isLinuxRuntime()) return () => {};
+  if (isLinuxRuntime()) return linuxSubscribe("shortcut-capture-edge", handler);
   if (!isTauriRuntime()) return () => {};
   const { listen } = await import("@tauri-apps/api/event");
   const unlisten = await listen<ShortcutCaptureEdge>("shortcut-capture-edge", (event) =>

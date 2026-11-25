@@ -12,7 +12,7 @@ from . import bridge
 from .input_mapping import InputController
 from .voice_hotkey import VoiceHotkey
 
-VERSION = '0.2.7'
+VERSION = '0.2.8'
 
 class DesktopAPI:
     def __init__(self, config_dir=None):

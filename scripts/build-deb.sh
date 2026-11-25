@@ -2,7 +2,7 @@
 set -eu
 umask 022
 PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-VERSION=0.2.7
+VERSION=0.2.8
 if [ ! -f "$PROJECT_DIR/frontend/dist/index.html" ]; then
     echo 'Build the frontend first: ./scripts/build-frontend.sh' >&2
     exit 1

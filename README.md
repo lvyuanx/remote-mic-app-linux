@@ -4,6 +4,8 @@
 
 ## 界面与移植状态
 
+0.2.8 补齐 Linux 自定义快捷键录入接口，接入当前 GTK 窗口的按键边沿，可录入 Ctrl 等组合，并在取消、超时、失焦或退出时清理；录入前已按住的键须先松开。桌面保留组合（例如 Super、Alt+Tab）使用现有安全录入模式：鼠标选择修饰键，再单独按主键。不读取全局键盘，也不要求新增权限。
+
 0.2.7 修复应用图标切换：默认与几何鸭使用独立资源，选择后同步更新侧栏、设置预览、窗口图标和当前用户的应用菜单入口；重启保留选择。设置 GTK 应用名称和 Wayland 程序标识，桌面显示「无线麦 Ubuntu 版」，避免显示 `__main__.py`。
 
 0.2.6 将 ATVV 语音会话接入已配置的按住说话快捷键：开始时按下、停止/中断/退出时释放；拦截所选遥控器语音键原生的 F5 报告。桌面虚拟麦克风改用稳定设备名，避免重启后语音工具保存的麦克风失效。首次升级需在 Vokie 中重新选择一次 SayAll_Microphone。后端不可用时界面显示「快捷键输出未就绪」，不再仅凭配置保存显示已联动。
@@ -36,7 +38,7 @@
 适用于 Ubuntu 24.04 或更新版本，需启用 Ubuntu 的 Universe 软件源及网络连接。安装包在 `dist/` 目录，安装时 apt 会安装所需的蓝牙和音频工具：
 
 ```bash
-sudo apt install ./dist/sayall-linux_0.2.7_all.deb
+sudo apt install ./dist/sayall-linux_0.2.8_all.deb
 ```
 
 安装后在应用菜单中搜索「无线麦 Ubuntu 版」或「SayAll Linux」启动。也可以在终端运行 `sayall-linux`。卸载使用 `sudo apt remove sayall-linux`。音频系统需要 PipeWire 的 `pipewire-pulse` 兼容层或 PulseAudio；请以当前桌面用户运行应用。

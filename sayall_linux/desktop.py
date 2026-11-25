@@ -15,6 +15,7 @@ from .desktop_api import DesktopAPI
 def run(test_hook=None):
     import gi
     gi.require_version('Gtk','3.0')
+    gi.require_version('Gdk','3.0')
     gi.require_version('WebKit2','4.1')
     from gi.repository import Gtk, WebKit2, GLib, Gio, Gdk
     GLib.set_prgname("sayall-linux")
@@ -61,11 +62,39 @@ def run(test_hook=None):
     view=WebKit2.WebView.new_with_user_content_manager(manager)
     view.get_settings().set_enable_developer_extras(False)
     window.add(view)
+    from .shortcut_capture import ShortcutCapture, key_from_name
+    capture = ShortcutCapture(lambda edge: input_event('shortcut-capture-edge', edge))
+    capture_timer = None
+    def stop_capture():
+        nonlocal capture_timer
+        if capture_timer is not None:
+            GLib.source_remove(capture_timer)
+            capture_timer = None
+        return capture.stop()
+    def cancel_capture(*_):
+        active = capture.active
+        stop_capture()
+        capture.focus_lost()
+        if active:
+            view.evaluate_javascript("window.dispatchEvent(new Event('blur'));",-1,None,None,None,None,None)
+        return False
+    def capture_key(_window, event):
+        # GTK delivers keys to the toplevel before WebKit's accelerators/IME.
+        # Translate without Shift so Ctrl+Shift+[ still records the '[' key.
+        keymap = Gdk.Keymap.get_for_display(window.get_display())
+        translated = keymap.translate_keyboard_state(event.hardware_keycode, Gdk.ModifierType(0), event.group)
+        keyval = translated.keyval if translated[0] else event.keyval
+        key = key_from_name(Gdk.keyval_name(keyval))
+        return capture.edge(event.hardware_keycode, key, event.type == Gdk.EventType.KEY_PRESS)
+    window.connect('key-press-event', capture_key)
+    window.connect('key-release-event', capture_key)
+    window.connect('focus-out-event', cancel_capture)
     closing=False
     def close(*_):
         nonlocal closing
         if closing: return True
         closing=True
+        stop_capture()
         window.set_sensitive(False)
         future=asyncio.run_coroutine_threadsafe(api.disconnect(),loop)
         def finished(_):
@@ -102,6 +131,19 @@ def run(test_hook=None):
         dialog.destroy()
         return path
     def native_main(command,args):
+        nonlocal capture_timer
+        if command == 'start_shortcut_capture':
+            if not window.is_active():raise RuntimeError('请先点击无线麦窗口，再录入快捷键')
+            preheld = capture.start()
+            def expired():
+                nonlocal capture_timer
+                capture_timer = None
+                capture.stop()
+                view.evaluate_javascript("window.dispatchEvent(new Event('blur'));",-1,None,None,None,None,None)
+                return False
+            capture_timer = GLib.timeout_add(16000, expired)
+            return preheld
+        if command == 'stop_shortcut_capture': return stop_capture()
         if command=='apply_app_icon':
             apply_icon(args['identifier'],window)
             logger.info('event=app_icon_changed identifier=%s',args['identifier'])
@@ -170,7 +212,7 @@ def run(test_hook=None):
         raise NotImplementedError('Linux: 此功能的 Linux 后端尚未完成移植：'+command)
     api.native=native
     def input_event(event,value):
-        names={'edge':'button-edge','gesture':'button-gesture','action-error':'linux-error'}
+        names={'edge':'button-edge','gesture':'button-gesture','action-error':'linux-error','shortcut-capture-edge':'shortcut-capture-edge'}
         if event not in names:return
         script='window.dispatchEvent(new CustomEvent('+json.dumps('sayall:'+names[event])+',{detail:'+json.dumps(value,ensure_ascii=False)+'}));'
         def send():

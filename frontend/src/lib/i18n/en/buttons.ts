@@ -1,5 +1,6 @@
 // English strings for buttons. Key = exact Chinese source passed to t().
 export default {
+  "请在当前窗口录入；Super、Alt+Tab 等桌面快捷键请开启安全录入模式，用鼠标选择修饰键，再按主键。": "Record in this window. For desktop shortcuts such as Super and Alt+Tab, enable safe capture, select modifiers with the mouse, then press the main key.",
   "未连接遥控器": "No remote connected",
   "保存锁定当前按键设置失败，请重试。": "Could not save the Lock Current Button setting. Try again.",
   "总开关已更新": "Master switch updated",
